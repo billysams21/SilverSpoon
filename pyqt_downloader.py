@@ -10,9 +10,10 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QFileDialog, QAbstractItemView,
     QCheckBox
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 
 import cloudscraper
+from playwright.sync_api import sync_playwright
 
 class DownloadTask:
     def __init__(self, link, save_dir):
@@ -20,19 +21,28 @@ class DownloadTask:
         self.base_save_dir = save_dir
         
         self.file_id = self.link.split('/')[-1].split('#')[0]
-        self.filename = self.link.split('#')[-1] if '#' in self.link else self.file_id
         
-        # Calculate smart directory grouping based on prefix
-        match = re.search(r'(.*?)(\.part\d+\.rar|\.rar)$', self.filename, re.IGNORECASE)
-        if match:
-            self.folder_name = match.group(1).strip('._-')
+        # Check if it's a filecrypt link
+        self.is_filecrypt = "filecrypt.cc" in self.link.lower()
+        if self.is_filecrypt:
+            self.filename = f"Filecrypt Container ({self.file_id})"
+            self.folder_name = "Filecrypt_Containers"
+            self.status = "Queued (Container)"
         else:
-            self.folder_name = self.filename.rsplit('.', 1)[0]
+            self.filename = self.link.split('#')[-1] if '#' in self.link else self.file_id
+            
+            # Calculate smart directory grouping based on prefix
+            match = re.search(r'(.*?)(\.part\d+\.rar|\.rar)$', self.filename, re.IGNORECASE)
+            if match:
+                self.folder_name = match.group(1).strip('._-')
+            else:
+                self.folder_name = self.filename.rsplit('.', 1)[0]
+                
+            self.status = "Queued"  # Queued, Pending, Starting..., Downloading, Paused, Cancelled, Completed, Extracting..., Extracted, Error
             
         self.save_dir = os.path.join(self.base_save_dir, self.folder_name)
         self.filepath = os.path.join(self.save_dir, self.filename)
         
-        self.status = "Queued"  # Queued, Pending, Starting..., Downloading, Paused, Cancelled, Completed, Extracting..., Extracted, Error
         self.progress = 0.0
         self.speed = 0.0
         self.downloaded_bytes = 0
@@ -44,6 +54,9 @@ class DownloadTask:
         self.is_selected = False
 
 class MainWindow(QMainWindow):
+    # Signals to safely update UI from background threads
+    filecrypt_links_found = pyqtSignal(list, str)
+    
     def __init__(self):
         super().__init__()
         self.setWindowTitle("FuckingFast Downloader - UI (PyQt6)")
@@ -54,6 +67,8 @@ class MainWindow(QMainWindow):
         self.scraper = cloudscraper.create_scraper(browser='chrome')
         self.is_all_selected = False
         self.extracted_folders = set()
+        
+        self.filecrypt_links_found.connect(self.add_extracted_filecrypt_links)
         
         self.setup_ui()
         
@@ -148,6 +163,30 @@ class MainWindow(QMainWindow):
         
         main_layout.addLayout(action_layout)
 
+    def add_extracted_filecrypt_links(self, links, save_dir):
+        for link in links:
+            if not any(t.link == link for t in self.tasks):
+                task = DownloadTask(link, save_dir)
+                task.status = "Pending"  # Auto-start them
+                
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                task.row_idx = row
+                
+                chk_item = QTableWidgetItem()
+                chk_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+                chk_item.setCheckState(Qt.CheckState.Checked)
+                task.is_selected = True
+                
+                self.table.setItem(row, 0, chk_item)
+                self.table.setItem(row, 1, QTableWidgetItem(f"{task.folder_name} / {task.filename}"))
+                self.table.setItem(row, 2, QTableWidgetItem(task.status))
+                self.table.setItem(row, 3, QTableWidgetItem("0%"))
+                self.table.setItem(row, 4, QTableWidgetItem("-"))
+                self.table.setItem(row, 5, QTableWidgetItem("-"))
+                
+                self.tasks.append(task)
+
     def browse_dir(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Save Directory", self.dir_input.text())
         if folder:
@@ -208,14 +247,14 @@ class MainWindow(QMainWindow):
 
     def start_downloads(self):
         for task in self.get_selected_tasks():
-            if task.status in ("Queued", "Cancelled", "Error"):
+            if task.status in ("Queued", "Queued (Container)", "Cancelled", "Error"):
                 task.status = "Pending"
                 task.cancel_flag = False
                 task.pause_flag = False
 
     def pause_selected(self):
         for task in self.get_selected_tasks():
-            if task.status in ("Downloading", "Pending", "Starting..."):
+            if task.status in ("Downloading", "Pending", "Starting...", "Resolving Container..."):
                 task.pause_flag = True
                 task.status = "Pausing..." if task.status == "Downloading" else "Paused"
 
@@ -228,7 +267,7 @@ class MainWindow(QMainWindow):
 
     def cancel_selected(self):
         for task in self.get_selected_tasks():
-            if task.status in ("Downloading", "Pending", "Paused", "Starting...", "Queued"):
+            if task.status in ("Downloading", "Pending", "Paused", "Starting...", "Queued", "Queued (Container)", "Resolving Container..."):
                 task.cancel_flag = True
                 task.pause_flag = False
                 task.status = "Cancelled"
@@ -260,12 +299,16 @@ class MainWindow(QMainWindow):
 
     def download_manager(self):
         while True:
-            active = sum(1 for t in self.tasks if t.status in ("Downloading", "Starting..."))
+            active = sum(1 for t in self.tasks if t.status in ("Downloading", "Starting...", "Resolving Container..."))
             if active < self.max_workers:
                 for task in self.tasks:
                     if task.status == "Pending":
-                        task.status = "Starting..."
-                        threading.Thread(target=self.download_worker, args=(task,), daemon=True).start()
+                        if getattr(task, 'is_filecrypt', False):
+                            task.status = "Resolving Container..."
+                            threading.Thread(target=self.resolve_filecrypt_worker, args=(task,), daemon=True).start()
+                        else:
+                            task.status = "Starting..."
+                            threading.Thread(target=self.download_worker, args=(task,), daemon=True).start()
                         active += 1
                         if active >= self.max_workers:
                             break
@@ -364,6 +407,74 @@ class MainWindow(QMainWindow):
         except Exception as e:
             for t in tasks_in_folder:
                 t.status = f"Extract Error"
+
+    def resolve_filecrypt_worker(self, task):
+        try:
+            real_links = []
+            with sync_playwright() as p:
+                # Local MS Edge frequently crashes with Playwright's headless=False injection.
+                # So we use the bundled Chromium that Playwright downloaded automatically.
+                browser = p.chromium.launch(headless=False)
+                        
+                context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                page = context.new_page()
+                
+                page.goto(task.link)
+                time.sleep(2)
+                
+                pow_box = page.locator(".pow-captcha__box")
+                if pow_box.count() > 0:
+                    pow_box.click(force=True)
+                    for _ in range(20):
+                        if task.cancel_flag:
+                            browser.close()
+                            task.status = "Cancelled"
+                            return
+                        time.sleep(1)
+                        if page.locator("button.cnlButton, a[href^='/Link/']").count() > 0:
+                            break
+                            
+                time.sleep(2)
+                links = page.locator("a[href^='/Link/'], a[onclick*='openLink']").all()
+                
+                for l in links:
+                    if task.cancel_flag:
+                        break
+                    try:
+                        href = l.get_attribute("href")
+                        onclick = l.get_attribute("onclick")
+                        
+                        target_url = None
+                        if href and "/Link/" in href:
+                            target_url = "https://filecrypt.cc" + href if href.startswith("/") else href
+                        elif onclick and "openLink" in onclick:
+                            m = re.search(r"openLink\(['\"]([^'\"]+)['\"]\)", onclick)
+                            if m:
+                                target_url = f"https://filecrypt.cc/Link/{m.group(1)}.html"
+                                
+                        if target_url:
+                            new_page = context.new_page()
+                            new_page.goto(target_url)
+                            new_page.wait_for_load_state("domcontentloaded")
+                            time.sleep(2)
+                            final_url = new_page.url
+                            if "fuckingfast" in final_url:
+                                real_links.append(final_url)
+                            new_page.close()
+                    except Exception:
+                        pass
+                browser.close()
+                
+            if real_links:
+                task.status = "Completed"
+                self.filecrypt_links_found.emit(real_links, task.base_save_dir)
+            else:
+                if not task.cancel_flag:
+                    task.status = "Error (No Links)"
+                    
+        except Exception as e:
+            if not task.cancel_flag:
+                task.status = f"Error: {str(e)[:20]}"
 
     def get_direct_link(self, task):
         try:

@@ -4,21 +4,100 @@ import time
 import threading
 import re
 import subprocess
+import json
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QFileDialog, QAbstractItemView,
-    QCheckBox
+    QCheckBox, QDialog, QFormLayout, QSpinBox, QDialogButtonBox,
+    QMessageBox, QInputDialog
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QDesktopServices
+from PyQt6.QtCore import Qt, QTimer, QUrl
 
 import cloudscraper
 from playwright.sync_api import sync_playwright
 
+def get_settings_path():
+    return os.path.expanduser("~/.fitgirl_downloader_settings.json")
+
+def load_settings():
+    default_settings = {
+        "default_save_dir": os.path.abspath("."),
+        "max_workers": 3,
+        "extract_after_download": False
+    }
+    settings_path = get_settings_path()
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+                # Merge defaults with loaded to handle missing keys in older configs
+                default_settings.update(loaded)
+        except Exception:
+            pass
+    return default_settings
+
+def save_settings(settings):
+    settings_path = get_settings_path()
+    try:
+        with open(settings_path, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, indent=4)
+    except Exception as e:
+        print(f"Failed to save settings: {e}")
+
+class SettingsDialog(QDialog):
+    def __init__(self, current_settings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setMinimumWidth(400)
+        
+        self.current_settings = current_settings
+        
+        layout = QFormLayout(self)
+        
+        # Save Directory
+        dir_layout = QHBoxLayout()
+        self.dir_input = QLineEdit(self.current_settings.get("default_save_dir", "."))
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self.browse_dir)
+        dir_layout.addWidget(self.dir_input)
+        dir_layout.addWidget(browse_btn)
+        layout.addRow("Default Save Directory:", dir_layout)
+        
+        # Max Workers
+        self.workers_spinbox = QSpinBox()
+        self.workers_spinbox.setRange(1, 10)
+        self.workers_spinbox.setValue(self.current_settings.get("max_workers", 3))
+        layout.addRow("Max Concurrent Downloads:", self.workers_spinbox)
+        
+        # Extract Option
+        self.extract_checkbox = QCheckBox()
+        self.extract_checkbox.setChecked(self.current_settings.get("extract_after_download", False))
+        layout.addRow("Extract after download by default:", self.extract_checkbox)
+        
+        # Buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addRow(button_box)
+
+    def browse_dir(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Save Directory", self.dir_input.text())
+        if folder:
+            self.dir_input.setText(os.path.abspath(folder))
+            
+    def get_updated_settings(self):
+        return {
+            "default_save_dir": self.dir_input.text(),
+            "max_workers": self.workers_spinbox.value(),
+            "extract_after_download": self.extract_checkbox.isChecked()
+        }
+
 class DownloadTask:
-    def __init__(self, link, save_dir):
+    def __init__(self, link, base_save_dir, folder_name=None):
         self.link = link.strip()
-        self.base_save_dir = save_dir
+        self.base_save_dir = base_save_dir
         
         self.file_id = self.link.split('/')[-1].split('#')[0]
         
@@ -26,18 +105,19 @@ class DownloadTask:
         self.is_filecrypt = "filecrypt.cc" in self.link.lower()
         if self.is_filecrypt:
             self.filename = f"Filecrypt Container ({self.file_id})"
-            self.folder_name = "Filecrypt_Containers"
+            self.folder_name = folder_name if folder_name else "Filecrypt_Containers"
             self.status = "Queued (Container)"
         else:
             self.filename = self.link.split('#')[-1] if '#' in self.link else self.file_id
-            
-            # Calculate smart directory grouping based on prefix
-            match = re.search(r'(.*?)(\.part\d+\.rar|\.rar)$', self.filename, re.IGNORECASE)
-            if match:
-                self.folder_name = match.group(1).strip('._-')
+            if folder_name:
+                self.folder_name = folder_name
             else:
-                self.folder_name = self.filename.rsplit('.', 1)[0]
-                
+                # Fallback calculate smart directory grouping based on prefix
+                match = re.search(r'(.*?)(\.part\d+\.rar|\.rar)$', self.filename, re.IGNORECASE)
+                if match:
+                    self.folder_name = match.group(1).strip('._-')
+                else:
+                    self.folder_name = self.filename.rsplit('.', 1)[0]
             self.status = "Queued"  # Queued, Pending, Starting..., Downloading, Paused, Cancelled, Completed, Extracting..., Extracted, Error
             
         self.save_dir = os.path.normpath(os.path.join(self.base_save_dir, self.folder_name))
@@ -62,8 +142,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("FuckingFast Downloader - UI (PyQt6)")
         self.resize(1000, 650)
         
+        self.settings = load_settings()
+        
         self.tasks = []
-        self.max_workers = 3
+        self.max_workers = self.settings.get("max_workers", 3)
         self.scraper = cloudscraper.create_scraper(browser='chrome')
         self.is_all_selected = False
         self.extracted_folders = set()
@@ -82,6 +164,47 @@ class MainWindow(QMainWindow):
         self.timer.start(500) # update every 500ms
 
     def setup_ui(self):
+        # Menu Bar Setup
+        menu_bar = self.menuBar()
+        
+        # File Menu
+        file_menu = menu_bar.addMenu("&File")
+        
+        import_action = QAction("&Import Links from File...", self)
+        import_action.triggered.connect(self.import_links_from_file)
+        file_menu.addAction(import_action)
+        
+        settings_action = QAction("&Settings", self)
+        settings_action.triggered.connect(self.open_settings_dialog)
+        file_menu.addAction(settings_action)
+        
+        file_menu.addSeparator()
+        
+        exit_action = QAction("&Exit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+        
+        # Help Menu
+        help_menu = menu_bar.addMenu("&Help")
+        
+        github_action = QAction("&GitHub Repository", self)
+        github_action.triggered.connect(self.open_github_link)
+        help_menu.addAction(github_action)
+        
+        contact_action = QAction("&Contact Us", self)
+        contact_action.triggered.connect(self.open_contact_link)
+        help_menu.addAction(contact_action)
+        
+        contributing_action = QAction("C&ontributing Guide", self)
+        contributing_action.triggered.connect(self.show_contributing_dialog)
+        help_menu.addAction(contributing_action)
+        
+        help_menu.addSeparator()
+        
+        about_action = QAction("&About", self)
+        about_action.triggered.connect(self.show_about_dialog)
+        help_menu.addAction(about_action)
+        
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
@@ -89,7 +212,7 @@ class MainWindow(QMainWindow):
         # 1. Directory Section
         dir_layout = QHBoxLayout()
         dir_layout.addWidget(QLabel("Base Save Directory:"))
-        self.dir_input = QLineEdit(os.path.abspath("."))
+        self.dir_input = QLineEdit(self.settings.get("default_save_dir", os.path.abspath(".")))
         dir_layout.addWidget(self.dir_input)
         browse_btn = QPushButton("Browse...")
         browse_btn.clicked.connect(self.browse_dir)
@@ -132,7 +255,7 @@ class MainWindow(QMainWindow):
         self.select_all_btn.clicked.connect(self.toggle_select_all)
         action_layout.addWidget(self.select_all_btn)
         
-        self.start_btn = QPushButton("Start Selected")
+        self.start_btn = QPushButton("Start / Resume")
         self.start_btn.setStyleSheet("background-color: #2ecc71; color: white; font-weight: bold; padding: 6px;")
         self.start_btn.clicked.connect(self.start_downloads)
         action_layout.addWidget(self.start_btn)
@@ -142,11 +265,6 @@ class MainWindow(QMainWindow):
         self.pause_btn.clicked.connect(self.pause_selected)
         action_layout.addWidget(self.pause_btn)
         
-        self.resume_btn = QPushButton("Resume")
-        self.resume_btn.setStyleSheet("background-color: #3498db; color: white; font-weight: bold; padding: 6px;")
-        self.resume_btn.clicked.connect(self.resume_selected)
-        action_layout.addWidget(self.resume_btn)
-        
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold; padding: 6px;")
         self.cancel_btn.clicked.connect(self.cancel_selected)
@@ -155,6 +273,7 @@ class MainWindow(QMainWindow):
         action_layout.addStretch()
         
         self.extract_checkbox = QCheckBox("Extract after download")
+        self.extract_checkbox.setChecked(self.settings.get("extract_after_download", False))
         action_layout.addWidget(self.extract_checkbox)
         
         clear_btn = QPushButton("Clear Completed")
@@ -187,6 +306,74 @@ class MainWindow(QMainWindow):
                 
                 self.tasks.append(task)
 
+    def import_links_from_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Import Links", "", "Text Files (*.txt);;All Files (*)")
+        if file_path:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    # Append to existing text or set it if empty
+                    current_text = self.text_links.toPlainText()
+                    if current_text.strip():
+                        self.text_links.setText(current_text + "\n" + content)
+                    else:
+                        self.text_links.setText(content)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to read file:\n{e}")
+
+    def open_github_link(self):
+        QDesktopServices.openUrl(QUrl("https://github.com/billysams21/FitGirlDownloader"))
+        
+    def open_contact_link(self):
+        QDesktopServices.openUrl(QUrl("https://github.com/billysams21/FitGirlDownloader/issues"))
+
+    def show_contributing_dialog(self):
+        QMessageBox.information(self, "Contributing Guide",
+            "<h3>Contributing to FitGirlDownloader</h3>"
+            "<p>We welcome contributions! Here is how you can help:</p>"
+            "<ul>"
+            "<li><b>Bug Reports:</b> Use the 'Contact Us' button to open an issue on GitHub. Please include steps to reproduce the error.</li>"
+            "<li><b>Feature Requests:</b> Have an idea? Open an issue on GitHub and tag it as an enhancement!</li>"
+            "<li><b>Pull Requests:</b>"
+            "  <ol>"
+            "    <li>Fork the repository.</li>"
+            "    <li>Create a new branch for your feature or bug fix.</li>"
+            "    <li>Test your changes locally.</li>"
+            "    <li>Submit a Pull Request with a clear description of your changes.</li>"
+            "  </ol>"
+            "</li>"
+            "</ul>"
+            "<p><i>Note: Please ensure your code follows the existing style and does not break current functionality.</i></p>"
+        )
+
+    def show_about_dialog(self):
+        QMessageBox.about(self, "About FuckingFast Downloader",
+            "<h3>FuckingFast Downloader v1.1</h3>"
+            "<p>A simple, fast downloader for FuckingFast links.</p>"
+            "<p>Select your links, paste them in, and hit Add!</p>"
+            "<hr>"
+            "<h4>Changelog (v1.1):</h4>"
+            "<ul>"
+            "<li><b>New:</b> Settings page with persistent configurations (Save Directory, Max Concurrent Downloads, Auto-extract).</li>"
+            "<li><b>New:</b> Import links directly from .txt files via the File menu.</li>"
+            "<li><b>New:</b> Batch Folder Prompt! Automatically groups main game parts and optional files into the exact same folder when adding links.</li>"
+            "<li><b>Changed:</b> Consolidated 'Start' and 'Resume' into a single, smarter action button.</li>"
+            "<li><b>Changed:</b> Improved top menu bar layout.</li>"
+            "</ul>"
+        )
+
+    def open_settings_dialog(self):
+        dialog = SettingsDialog(self.settings, self)
+        if dialog.exec():
+            # User clicked Save
+            self.settings = dialog.get_updated_settings()
+            save_settings(self.settings)
+            
+            # Apply immediate UI/State updates
+            self.max_workers = self.settings.get("max_workers", 3)
+            self.dir_input.setText(self.settings.get("default_save_dir", "."))
+            self.extract_checkbox.setChecked(self.settings.get("extract_after_download", False))
+
     def browse_dir(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Save Directory", self.dir_input.text())
         if folder:
@@ -198,10 +385,37 @@ class MainWindow(QMainWindow):
             return
             
         links = [line.strip() for line in text.split('\n') if line.strip() and line.startswith('http')]
+        if not links:
+            return
+            
         save_dir = os.path.abspath(self.dir_input.text())
         
+        # Try to guess a folder name from the first link
+        suggested_folder = ""
+        first_link = links[0]
+        first_filename = first_link.split('#')[-1] if '#' in first_link else first_link.split('/')[-1].split('#')[0]
+        match = re.search(r'(.*?)(\.part\d+\.rar|\.rar)$', first_filename, re.IGNORECASE)
+        if match:
+            suggested_folder = match.group(1).strip('._-')
+        else:
+            suggested_folder = first_filename.rsplit('.', 1)[0]
+            
+        # Prompt user for batch folder name
+        folder_name, ok = QInputDialog.getText(
+            self, 
+            "Batch Folder Name", 
+            "Enter a folder name for these files:\n(This groups main game and optional files together)",
+            QLineEdit.EchoMode.Normal,
+            suggested_folder
+        )
+        
+        if not ok or not folder_name.strip():
+            return # User cancelled
+            
+        folder_name = folder_name.strip()
+        
         for link in links:
-            task = DownloadTask(link, save_dir)
+            task = DownloadTask(link, save_dir, folder_name)
             row = self.table.rowCount()
             self.table.insertRow(row)
             task.row_idx = row
@@ -247,7 +461,7 @@ class MainWindow(QMainWindow):
 
     def start_downloads(self):
         for task in self.get_selected_tasks():
-            if task.status in ("Queued", "Queued (Container)", "Cancelled", "Error"):
+            if task.status in ("Queued", "Queued (Container)", "Cancelled", "Error", "Paused"):
                 task.status = "Pending"
                 task.cancel_flag = False
                 task.pause_flag = False
@@ -257,13 +471,6 @@ class MainWindow(QMainWindow):
             if task.status in ("Downloading", "Pending", "Starting...", "Resolving Container..."):
                 task.pause_flag = True
                 task.status = "Pausing..." if task.status == "Downloading" else "Paused"
-
-    def resume_selected(self):
-        for task in self.get_selected_tasks():
-            if task.status in ("Paused", "Error", "Cancelled"):
-                task.pause_flag = False
-                task.cancel_flag = False
-                task.status = "Pending"
 
     def cancel_selected(self):
         for task in self.get_selected_tasks():

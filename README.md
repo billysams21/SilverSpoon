@@ -8,9 +8,11 @@ A Python-based bulk downloader designed to bypass Cloudflare protections on file
 
 * **Cloudflare Bypass:** Uses `cloudscraper` to mimic a real browser and bypass anti-bot challenges.
 * **Filecrypt Container Support:** Paste a `filecrypt.cc` container link, and the app will automatically launch a visible Chromium instance, solve the Proof-of-Work CAPTCHA, bypass the invisible ad overlays, and seamlessly inject the hidden `fuckingfast.co` URLs directly into your download queue.
-* **Smart Folder Grouping:** Automatically groups multi-part files (e.g. `part01`, `part02`) into their own subfolder based on the common prefix.
+* **Smart Folder Grouping & Batching:** Automatically suggests a unified folder name for a batch of links, perfectly grouping main game parts and messy optional files together.
+* **Persistent Settings:** Your preferences (save directory, concurrent workers, extraction options) are saved and remembered for your next session.
+* **Import Links:** Easily load bulk link lists from `.txt` files directly via the File menu.
 * **Direct Link Extraction:** Automatically simulates the internal HTMX POST requests required to fetch the real `.rar` direct links.
-* **Multi-threading:** Downloads multiple parts concurrently (default 3 workers) to maximize bandwidth.
+* **Multi-threading:** Downloads multiple parts concurrently (default 3 workers, customizable in Settings) to maximize bandwidth.
 * **Pause & Resume:** Safely pause your downloads or recover from network drops. The script checks existing file sizes and resumes using HTTP `Range` headers.
 * **Graphical Interface:** Includes a clean, modern GUI built with PyQt6.
 * **Command Line Interface:** Also includes a lightweight CLI script for server environments or automation.
@@ -42,19 +44,19 @@ python pyqt_downloader.py
 
 ![App Screenshot 1](assets/screenshot1.png)
 
-1. Click **Browse...** to select your base save directory.
-2. Open the game link and click the provider you want to use (for now it's FuckingFast). Alternatively, you can copy the `filecrypt.cc` URL directly.
+1. Click **Browse...** to select your base save directory (or set a persistent default in `File -> Settings`).
+2. Open the game link and click the provider you want to use (for now it's FuckingFast).
 ![FitGirl 1](assets/fitgirl1.png)
 3. Copy the links you want to download.
 ![FitGirl 2](assets/fitgirl2.png)
-4. Paste your `fuckingfast.co` or `filecrypt.cc` links into the top text box (one per line).
+4. Paste your `fuckingfast.co` or `filecrypt.cc` links into the top text box (one per line) or use `File -> Import Links from File...`.
 ![App Screenshot 2](assets/screenshot2.png)
-5. Click **Add Links to Queue**. The links will appear in the table below, automatically grouped by folder name.
+5. Click **Add Links to Queue**. A prompt will appear allowing you to confirm the Batch Folder name so all main and optional files go to the exact same place.
 6. Click **Select All** (or check individual boxes) for the files you want to download.
 7. (Optional) Check the **Extract after download** checkbox if you want files extracted automatically using the built-in 7-Zip engine.
-8. Click the green **Start Selected** button to begin downloading (up to 3 concurrently).
+8. Click the green **Start / Resume** button to begin downloading.
 ![App Screenshot 3](assets/screenshot3.png)
-9. Use the **Pause** and **Resume** buttons to manage your selected downloads at any time.
+9. Use the **Pause** and **Start / Resume** buttons to manage your selected downloads at any time.
 
 ### Using the CLI
 If you prefer the command line:

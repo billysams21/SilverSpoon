@@ -157,6 +157,7 @@ class DownloadTask:
         self.downloaded_bytes = 0
         self.total_bytes = 0
         self.error_message = ""
+        self.bypass_retries = 0
         
         self.pause_flag = False
         self.cancel_flag = False
@@ -238,6 +239,11 @@ class MainWindow(QMainWindow):
         self.scraper = cloudscraper.create_scraper(browser='chrome')
         self.is_all_selected = False
         self.extracted_folders = set()
+        
+        # Cloudflare Bypass state
+        self.bypass_in_progress = False
+        self.bypass_lock = threading.Lock()
+        self.last_bypass_time = 0
         
         self.setup_ui()
         self.load_tasks_from_history()
@@ -821,6 +827,7 @@ class MainWindow(QMainWindow):
             if task.status in ("Queued", "Cancelled", "Error", "Paused"):
                 task.status = "Pending"
                 task.error_message = ""
+                task.bypass_retries = 0
                 task.cancel_flag = False
                 task.pause_flag = False
 
@@ -842,6 +849,7 @@ class MainWindow(QMainWindow):
             if "Error" in task.status:
                 task.status = "Pending"
                 task.error_message = ""
+                task.bypass_retries = 0
                 task.cancel_flag = False
                 task.pause_flag = False
 
@@ -877,6 +885,7 @@ class MainWindow(QMainWindow):
             task.downloaded_bytes = 0
             task.total_bytes = 0
             task.error_message = ""
+            task.bypass_retries = 0
             task.status = "Pending"
             self.extracted_folders.discard(task.folder_name)
             redownloaded += 1
@@ -1088,15 +1097,19 @@ class MainWindow(QMainWindow):
 
     def download_manager(self):
         while True:
-            active = sum(1 for t in self.tasks if t.status in ("Downloading", "Starting..."))
-            if active < self.max_workers:
-                for task in self.tasks:
-                    if task.status == "Pending":
-                        task.status = "Starting..."
-                        threading.Thread(target=self.download_worker, args=(task,), daemon=True).start()
-                        active += 1
-                        if active >= self.max_workers:
-                            break
+            # If a Cloudflare bypass window is open, pause starting any new downloads until it finishes!
+            if not getattr(self, 'bypass_in_progress', False):
+                active = sum(1 for t in self.tasks if t.status in ("Downloading", "Starting..."))
+                if active < self.max_workers:
+                    for task in self.tasks:
+                        if task.status == "Pending":
+                            task.status = "Starting..."
+                            threading.Thread(target=self.download_worker, args=(task,), daemon=True).start()
+                            active += 1
+                            if active >= self.max_workers:
+                                break
+                            # Slight stagger to prevent Cloudflare/Rate-limit panic on batch start
+                            time.sleep(0.5)
             
             # Check for extraction
             if self.extract_checkbox.isChecked():
@@ -1227,6 +1240,110 @@ class MainWindow(QMainWindow):
                 self.extracted_folders.remove(folder_name)
             self.trigger_history_save()
 
+    def trigger_cloudflare_bypass(self, url):
+        with self.bypass_lock:
+            # Prevent opening a new window if one is currently open or if we just closed one within 15 seconds
+            if self.bypass_in_progress or (time.time() - self.last_bypass_time < 15):
+                return
+            self.bypass_in_progress = True
+            
+        logging.info("Triggering Cloudflare Bypass window...")
+        threading.Thread(target=self._run_bypass_worker, args=(url,), daemon=True).start()
+
+    def _run_bypass_worker(self, url):
+        try:
+            # We use subprocess to launch the pywebview window. 
+            # This prevents UI thread blocking and crashes related to mixed Qt/Webview engines.
+            if hasattr(sys, '_MEIPASS'):
+                script_path = os.path.join(sys._MEIPASS, 'cf_bypass.py')
+            else:
+                script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cf_bypass.py')
+            
+            # Use pythonw if running in a frozen executable to avoid opening a console
+            executable = sys.executable
+            if sys.platform == 'win32' and executable.lower().endswith('python.exe') and not hasattr(sys, '_MEIPASS'):
+                pass # Use standard python during dev
+            elif sys.platform == 'win32' and hasattr(sys, '_MEIPASS'):
+                pass # Already a windowed GUI executable
+
+            creationflags = 0x08000000 if sys.platform == 'win32' else 0
+            
+            # Determine if we run via Python interpreter or embedded executable
+            if not getattr(sys, 'frozen', False):
+                cmd = [sys.executable, script_path, url]
+            else:
+                # If compiled with PyInstaller, we bundle the cf_bypass code.
+                # However, since we can't easily spawn a new python process without shipping a full python.exe, 
+                # we spawn the main executable with a specific argument.
+                cmd = [sys.executable, '--run-bypass', url]
+
+            logging.info(f"Launching bypass subprocess: {cmd}")
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                creationflags=creationflags
+            )
+            
+            output = result.stdout.strip()
+            # Find the last valid JSON output (in case pywebview prints garbage)
+            json_str = None
+            for line in reversed(output.split('\n')):
+                if line.startswith('{') and line.endswith('}'):
+                    json_str = line
+                    break
+                    
+            if json_str:
+                data = json.loads(json_str)
+                if 'cf_clearance' in data:
+                    logging.info("Bypass successful, updating scraper session.")
+                    # Clear out the cloudscraper's old cookies/headers entirely to avoid conflicts
+                    self.scraper.cookies.clear()
+                    # Inject golden cookie and exactly match the Webview's User-Agent
+                    self.scraper.cookies.set('cf_clearance', data['cf_clearance'], domain='.fuckingfast.co')
+                    self.scraper.headers.update({
+                        'User-Agent': data['user_agent'],
+                        'Referer': 'https://fuckingfast.co/',
+                        'Origin': 'https://fuckingfast.co'
+                    })
+                    
+                    # Also inject other cookies grabbed just in case FuckingFast uses specific session tracking
+                    for k, v in data.get('all_cookies', {}).items():
+                        if k != 'cf_clearance':
+                            self.scraper.cookies.set(k, v, domain='.fuckingfast.co')
+                    
+                    # Restart any tasks that failed with 403
+                    self._restart_403_tasks()
+                else:
+                    logging.error(f"Bypass window closed without solving. Result: {data}")
+            else:
+                logging.error(f"Failed to parse bypass output. Output: {output}, Error: {result.stderr}")
+                
+        except Exception as e:
+            logging.error(f"Bypass worker exception: {e}", exc_info=True)
+        finally:
+            with self.bypass_lock:
+                self.bypass_in_progress = False
+                self.last_bypass_time = time.time()
+
+    def _restart_403_tasks(self):
+        # Restart tasks that encountered a 403, but ONLY if they haven't exhausted their bypass retries.
+        restarted_count = 0
+        for task in self.tasks:
+            if task.status == "Error" and ("403" in task.error_message or "503" in task.error_message):
+                if task.bypass_retries < 3:
+                    task.bypass_retries += 1
+                    task.status = "Pending"
+                    task.error_message = ""
+                    task.cancel_flag = False
+                    task.pause_flag = False
+                    restarted_count += 1
+                else:
+                    task.error_message = "Cloudflare Bypass failed repeatedly. Please turn off your VPN or check the link manually."
+                    
+        if restarted_count > 0:
+            logging.info(f"Automatically restarted {restarted_count} tasks after Cloudflare bypass.")
+
     def get_direct_link(self, task):
         try:
             res = self.scraper.get(task.link)
@@ -1234,6 +1351,7 @@ class MainWindow(QMainWindow):
                 task.error_message = f"Could not open the file page. Server returned HTTP {res.status_code}."
                 if res.status_code in (403, 503):
                     logging.error(f"Got {res.status_code} for {task.link}. Response body preview: {res.text[:500]}")
+                    self.trigger_cloudflare_bypass(task.link)
                 return None
             
             post_url = f"https://fuckingfast.co/f/{task.file_id}/go"
@@ -1311,6 +1429,8 @@ class MainWindow(QMainWindow):
                     if r.status_code in (403, 503):
                         preview = r.text[:500] if hasattr(r, 'text') else "No text body"
                         logging.error(f"Download 403/503 for {dl_url}. Body preview: {preview}")
+                        # Use the original task link for the bypass, as dl_url might just be a hotlink token
+                        self.trigger_cloudflare_bypass(task.link)
                     return
                     
                 if r.status_code == 200 and initial_size > 0:
@@ -1366,6 +1486,12 @@ class MainWindow(QMainWindow):
                 self.trigger_history_save()
 
 if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[1] == '--run-bypass':
+        url = sys.argv[2]
+        import cf_bypass
+        cf_bypass.run_bypass(url)
+        sys.exit(0)
+
     app = QApplication(sys.argv)
     
     # Determine base directory for assets

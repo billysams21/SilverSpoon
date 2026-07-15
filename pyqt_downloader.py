@@ -5,15 +5,23 @@ import threading
 import re
 import subprocess
 import json
+import logging
+
+logging.basicConfig(
+    filename=os.path.expanduser("~/.silverspoon.log"),
+    level=logging.ERROR,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit, QTreeWidget,
     QTreeWidgetItem, QHeaderView, QFileDialog, QAbstractItemView,
     QCheckBox, QDialog, QFormLayout, QSpinBox, QDialogButtonBox,
-    QMessageBox, QInputDialog, QSplashScreen
+    QMessageBox, QInputDialog, QSplashScreen, QMenu
 )
 from PyQt6.QtGui import QAction, QDesktopServices, QIcon, QPixmap
-from PyQt6.QtCore import Qt, QTimer, QUrl
+from PyQt6.QtCore import Qt, QTimer, QUrl, QEvent
 
 import cloudscraper
 
@@ -46,6 +54,26 @@ def save_settings(settings):
             json.dump(settings, f, indent=4)
     except Exception as e:
         print(f"Failed to save settings: {e}")
+
+def format_error_message(error, max_length=160):
+    text = str(error).strip()
+    lower_text = text.lower()
+    error_type = type(error).__name__
+
+    if "connectionabortederror" in lower_text or "10053" in text:
+        return "Connection was aborted by your computer or network security software. Try again, or check firewall/antivirus settings."
+    if "connection reset" in lower_text or "connectionreseterror" in lower_text:
+        return "Connection was reset by the server or your network. Try again later."
+    if "timed out" in lower_text or "timeout" in lower_text:
+        return "The connection timed out. Check your network and try again."
+
+    if not text:
+        return error_type
+
+    text = re.sub(r"\s+", " ", text)
+    if len(text) > max_length:
+        text = text[:max_length].rstrip() + "..."
+    return f"{error_type}: {text}"
 
 class SettingsDialog(QDialog):
     def __init__(self, current_settings, parent=None):
@@ -128,6 +156,7 @@ class DownloadTask:
         self.speed = 0.0
         self.downloaded_bytes = 0
         self.total_bytes = 0
+        self.error_message = ""
         
         self.pause_flag = False
         self.cancel_flag = False
@@ -140,6 +169,7 @@ class DownloadTask:
             "base_save_dir": self.base_save_dir,
             "folder_name": self.folder_name,
             "status": self.status,
+            "error_message": self.error_message,
             "downloaded_bytes": self.downloaded_bytes,
             "total_bytes": self.total_bytes,
             "progress": self.progress
@@ -158,6 +188,7 @@ class DownloadTask:
         task.downloaded_bytes = data.get("downloaded_bytes", 0)
         task.total_bytes = data.get("total_bytes", 0)
         task.progress = data.get("progress", 0.0)
+        task.error_message = data.get("error_message", "")
         return task
 
 def get_history_path():
@@ -349,14 +380,15 @@ class MainWindow(QMainWindow):
         self.tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.show_tree_context_menu)
         
-        # Remove dotted focus box on clicked cells
-        self.tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.tree.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.tree.installEventFilter(self)
         
         self.tree.itemClicked.connect(self.handle_item_clicked)
         self.tree.itemSelectionChanged.connect(self.handle_item_selection_changed)
         # Apply a stylesheet to ensure checkboxes are centered in their new logical column
-        # Also remove any outline when an item is selected
         self.tree.setStyleSheet("""
             QTreeView::indicator { width: 16px; height: 16px; }
             QTreeView::item:selected { outline: none; }
@@ -385,10 +417,20 @@ class MainWindow(QMainWindow):
         self.cancel_btn.clicked.connect(self.cancel_selected)
         action_layout.addWidget(self.cancel_btn)
         
-        self.retry_btn = QPushButton("Retry Error")
+        self.retry_btn = QPushButton("Retry")
         self.retry_btn.setStyleSheet("background-color: #9b59b6; color: white; font-weight: bold; padding: 6px;")
         self.retry_btn.clicked.connect(self.retry_selected)
         action_layout.addWidget(self.retry_btn)
+
+        self.force_redownload_btn = QPushButton("Force Redownload")
+        self.force_redownload_btn.setStyleSheet("background-color: #300101; color: white; font-weight: bold; padding: 6px;")
+        self.force_redownload_btn.clicked.connect(self.force_redownload_selected)
+        action_layout.addWidget(self.force_redownload_btn)
+
+        self.copy_log_btn = QPushButton("Copy Error Details")
+        self.copy_log_btn.setStyleSheet("background-color: #555; color: white; font-weight: bold; padding: 6px;")
+        self.copy_log_btn.clicked.connect(self.copy_selected_error_log)
+        action_layout.addWidget(self.copy_log_btn)
         
         self.delete_btn = QPushButton("🗑️ Delete")
         self.delete_btn.setStyleSheet("background-color: #34495e; color: white; font-weight: bold; padding: 6px;")
@@ -410,8 +452,52 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             self.delete_selected()
+        elif event.key() == Qt.Key.Key_F:
+            self.force_redownload_selected()
         else:
             super().keyPressEvent(event)
+
+    def eventFilter(self, source, event):
+        if source == self.tree and event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+                self.delete_selected()
+                return True
+            if event.key() == Qt.Key.Key_F:
+                self.force_redownload_selected()
+                return True
+            if event.key() == Qt.Key.Key_S:
+                self.start_downloads()
+                return True
+            if event.key() == Qt.Key.Key_P:
+                self.pause_selected()
+                return True
+            if event.key() == Qt.Key.Key_C:
+                self.cancel_selected()
+                return True
+            if event.key() == Qt.Key.Key_R:
+                self.retry_selected()
+                return True
+        return super().eventFilter(source, event)
+
+    def show_tree_context_menu(self, position):
+        item = self.tree.itemAt(position)
+        if item and not any(t.tree_item and t.tree_item.checkState(1) == Qt.CheckState.Checked for t in self.tasks):
+            if not item.isSelected():
+                self.tree.clearSelection()
+            self.tree.setCurrentItem(item)
+            item.setSelected(True)
+
+        menu = QMenu(self)
+        menu.addAction("[S] Start / Resume", self.start_downloads)
+        menu.addAction("[P] Pause", self.pause_selected)
+        menu.addAction("[C] Cancel", self.cancel_selected)
+        menu.addSeparator()
+        menu.addAction("[R] Retry", self.retry_selected)
+        menu.addAction("[F] Force Redownload", self.force_redownload_selected)
+        menu.addAction("Copy Error Details", self.copy_selected_error_log)
+        menu.addSeparator()
+        menu.addAction("Delete", self.delete_selected)
+        menu.exec(self.tree.viewport().mapToGlobal(position))
 
     def get_or_create_batch_item(self, folder_name):
         # Search for existing top-level item with this folder name
@@ -462,9 +548,42 @@ class MainWindow(QMainWindow):
         child_item.setText(6, "-")
         
         task.tree_item = child_item
+        
         if task not in self.tasks:
             self.tasks.append(task)
             self.trigger_history_save()
+
+    def copy_selected_error_log(self):
+        for task in self.get_selected_tasks():
+            if "Error" in task.status:
+                self.copy_error_log(task)
+                return
+        QMessageBox.information(self, "No Error Selected", "Select a failed task first, then copy its error details.")
+
+    def copy_error_log(self, task):
+        log_path = os.path.expanduser("~/.silverspoon.log")
+        if not os.path.exists(log_path):
+            QMessageBox.information(self, "No Log", "No error log found.")
+            return
+            
+        try:
+            with open(log_path, 'r', encoding='utf-8') as f:
+                logs = f.readlines()
+                
+            keywords = [task.link, task.file_id, task.filename]
+            matching_logs = [line for line in logs if any(keyword and keyword in line for keyword in keywords)]
+            relevant_logs = "".join(matching_logs[-20:] if matching_logs else logs[-20:])
+            
+            if not relevant_logs.strip():
+                QMessageBox.information(self, "Log Empty", "The error log is empty.")
+                return
+                
+            clipboard = QApplication.clipboard()
+            log_label = "Matching log lines" if matching_logs else "Recent log lines"
+            clipboard.setText(f"Task File: {task.filename}\nTask Link: {task.link}\nStatus: {task.status}\n\n{log_label}:\n{relevant_logs}")
+            QMessageBox.information(self, "Log Copied", "Relevant error logs have been copied to your clipboard.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not read log file: {e}")
 
     def load_tasks_from_history(self):
         loaded_tasks = load_history()
@@ -523,7 +642,7 @@ class MainWindow(QMainWindow):
             "<li><b>New:</b> Batch folders with collapsible tree UI.</li>"
             "<li><b>New:</b> Live global speed tracking and ETAs.</li>"
             "<li><b>New:</b> Delete button/key to trash files and tasks.</li>"
-            "<li><b>New:</b> 'Retry Error' and 'Paste from Clipboard' buttons.</li>"
+            "<li><b>New:</b> 'Retry' and 'Paste from Clipboard' buttons.</li>"
             "</ul>"
             "<p><i>See CHANGELOG.md for full details.</i></p>"
         )
@@ -701,6 +820,7 @@ class MainWindow(QMainWindow):
         for task in self.get_selected_tasks():
             if task.status in ("Queued", "Cancelled", "Error", "Paused"):
                 task.status = "Pending"
+                task.error_message = ""
                 task.cancel_flag = False
                 task.pause_flag = False
 
@@ -721,8 +841,52 @@ class MainWindow(QMainWindow):
         for task in self.get_selected_tasks():
             if "Error" in task.status:
                 task.status = "Pending"
+                task.error_message = ""
                 task.cancel_flag = False
                 task.pause_flag = False
+
+    def force_redownload_selected(self):
+        tasks_to_redownload = self.get_selected_tasks()
+        if not tasks_to_redownload:
+            QMessageBox.information(self, "No Selection", "Select one or more tasks to force redownload.")
+            return
+
+        active_statuses = {"Downloading", "Pending", "Starting...", "Pausing...", "Extracting..."}
+        redownloaded = 0
+        skipped = 0
+        failed = 0
+
+        for task in tasks_to_redownload:
+            if task.status in active_statuses:
+                skipped += 1
+                continue
+
+            try:
+                if os.path.exists(task.filepath):
+                    os.remove(task.filepath)
+            except Exception as e:
+                failed += 1
+                task.status = "Error"
+                task.error_message = f"Could not delete existing file before redownload. {format_error_message(e)}"
+                continue
+
+            task.cancel_flag = False
+            task.pause_flag = False
+            task.progress = 0.0
+            task.speed = 0.0
+            task.downloaded_bytes = 0
+            task.total_bytes = 0
+            task.error_message = ""
+            task.status = "Pending"
+            self.extracted_folders.discard(task.folder_name)
+            redownloaded += 1
+
+        if skipped or failed or redownloaded == 0:
+            QMessageBox.information(
+                self,
+                "Force Redownload",
+                f"Queued: {redownloaded}\nSkipped active tasks: {skipped}\nFailed: {failed}"
+            )
 
     def delete_selected(self):
         tasks_to_delete = self.get_selected_tasks()
@@ -842,6 +1006,13 @@ class MainWindow(QMainWindow):
                 eta_str = "-"
             
             task.tree_item.setText(2, task.status)
+            # Apply word wrap to the tooltip text to avoid very long horizontal lines
+            if "Error" in task.status and task.error_message:
+                import textwrap
+                wrapped_text = "\n".join(textwrap.wrap(task.error_message, width=60))
+                task.tree_item.setToolTip(2, wrapped_text)
+            else:
+                task.tree_item.setToolTip(2, "")
             task.tree_item.setText(3, prog_str)
             task.tree_item.setText(4, speed_str)
             task.tree_item.setText(5, eta_str)
@@ -909,6 +1080,7 @@ class MainWindow(QMainWindow):
                 eta_str = self.format_eta(eta_seconds)
             
             batch_item.setText(2, batch_status)
+            batch_item.setToolTip(2, "")
             batch_item.setText(3, prog_str)
             batch_item.setText(4, speed_str)
             batch_item.setText(5, eta_str)
@@ -987,6 +1159,7 @@ class MainWindow(QMainWindow):
             if not first_vol:
                 for t in tasks_in_folder:
                     t.status = "Extract Error (No File)"
+                    t.error_message = f"No archive file was found in {save_dir}."
                 if folder_name in self.extracted_folders:
                     self.extracted_folders.remove(folder_name)
                 return
@@ -1016,6 +1189,7 @@ class MainWindow(QMainWindow):
             if not cmd:
                 for t in tasks_in_folder:
                     t.status = "Extract Error (No extractor found)"
+                    t.error_message = "No supported extractor was found. Install 7-Zip or WinRAR, then retry extraction."
                 if folder_name in self.extracted_folders:
                     self.extracted_folders.remove(folder_name)
                 return
@@ -1033,17 +1207,22 @@ class MainWindow(QMainWindow):
             
             for t in tasks_in_folder:
                 t.status = "Extracted"
+                t.error_message = ""
             self.trigger_history_save()
                 
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Extraction error (subprocess): {e}", exc_info=True)
             for t in tasks_in_folder:
                 t.status = "Extract Error (Corrupt?)"
+                t.error_message = f"Extractor failed with exit code {e.returncode}. The archive may be corrupt, incomplete, or password-protected."
             if folder_name in self.extracted_folders:
                 self.extracted_folders.remove(folder_name)
             self.trigger_history_save()
         except Exception as e:
+            logging.error(f"Extraction error: {e}", exc_info=True)
             for t in tasks_in_folder:
                 t.status = f"Extract Error"
+                t.error_message = f"Extraction failed: {format_error_message(e)}"
             if folder_name in self.extracted_folders:
                 self.extracted_folders.remove(folder_name)
             self.trigger_history_save()
@@ -1052,6 +1231,7 @@ class MainWindow(QMainWindow):
         try:
             res = self.scraper.get(task.link)
             if res.status_code != 200:
+                task.error_message = f"Could not open the file page. Server returned HTTP {res.status_code}."
                 return None
             
             post_url = f"https://fuckingfast.co/f/{task.file_id}/go"
@@ -1063,9 +1243,18 @@ class MainWindow(QMainWindow):
             }
             res2 = self.scraper.post(post_url, headers=headers)
             if res2.status_code == 200:
-                return res2.headers.get('Hx-Redirect')
-        except Exception:
+                direct_link = res2.headers.get('Hx-Redirect')
+                if direct_link:
+                    return direct_link
+                task.error_message = "The file host did not return a direct download link. The link may be expired or unavailable."
+            else:
+                task.error_message = f"Could not request the direct download link. Server returned HTTP {res2.status_code}."
+        except Exception as e:
+            logging.error(f"Error getting direct link for {task.link}: {e}", exc_info=True)
+            task.error_message = f"Could not get the direct download link. {format_error_message(e)}"
             return None
+        if not task.error_message:
+            task.error_message = "Could not get the direct download link. The link may be expired or blocked."
         return None
 
     def download_worker(self, task):
@@ -1073,6 +1262,8 @@ class MainWindow(QMainWindow):
         if not dl_url:
             if not task.cancel_flag and not task.pause_flag:
                 task.status = "Error"
+                if not task.error_message:
+                    task.error_message = "Could not get the direct download link."
             return
             
         if task.cancel_flag:
@@ -1084,6 +1275,7 @@ class MainWindow(QMainWindow):
             return
 
         task.status = "Downloading"
+        task.error_message = ""
         
         try:
             if not os.path.exists(task.save_dir):
@@ -1101,6 +1293,7 @@ class MainWindow(QMainWindow):
                 task.downloaded_bytes = total_size
                 task.progress = 100
                 task.status = "Completed"
+                task.error_message = ""
                 return
                 
             resume_header = {}
@@ -1112,6 +1305,7 @@ class MainWindow(QMainWindow):
             with self.scraper.get(dl_url, stream=True, headers=resume_header) as r:
                 if r.status_code not in (200, 206):
                     task.status = "Error"
+                    task.error_message = f"Download request failed. Server returned HTTP {r.status_code}."
                     return
                     
                 if r.status_code == 200 and initial_size > 0:
@@ -1156,11 +1350,14 @@ class MainWindow(QMainWindow):
                 task.progress = 100
                 task.speed = 0
                 task.status = "Completed"
+                task.error_message = ""
                 self.trigger_history_save()
                 
         except Exception as e:
+            logging.error(f"Download worker error for task {task.link}: {e}", exc_info=True)
             if not task.cancel_flag and not task.pause_flag:
                 task.status = "Error"
+                task.error_message = f"Download failed. {format_error_message(e)}"
                 self.trigger_history_save()
 
 if __name__ == "__main__":

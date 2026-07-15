@@ -1232,6 +1232,8 @@ class MainWindow(QMainWindow):
             res = self.scraper.get(task.link)
             if res.status_code != 200:
                 task.error_message = f"Could not open the file page. Server returned HTTP {res.status_code}."
+                if res.status_code in (403, 503):
+                    logging.error(f"Got {res.status_code} for {task.link}. Response body preview: {res.text[:500]}")
                 return None
             
             post_url = f"https://fuckingfast.co/f/{task.file_id}/go"
@@ -1306,6 +1308,9 @@ class MainWindow(QMainWindow):
                 if r.status_code not in (200, 206):
                     task.status = "Error"
                     task.error_message = f"Download request failed. Server returned HTTP {r.status_code}."
+                    if r.status_code in (403, 503):
+                        preview = r.text[:500] if hasattr(r, 'text') else "No text body"
+                        logging.error(f"Download 403/503 for {dl_url}. Body preview: {preview}")
                     return
                     
                 if r.status_code == 200 and initial_size > 0:

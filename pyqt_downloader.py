@@ -920,37 +920,40 @@ class MainWindow(QMainWindow):
                     self.extracted_folders.remove(folder_name)
                 return
                 
-            # Define paths to extractors
-            # Check for bundled 7z.exe (PyInstaller extracts it to sys._MEIPASS in temp dir)
-            if hasattr(sys, '_MEIPASS'):
-                bundled_7z = os.path.join(sys._MEIPASS, '7z.exe')
-            else:
-                bundled_7z = os.path.join(os.path.dirname(os.path.abspath(__file__)), '7z.exe')
-                
-            installed_7z = r"C:\Program Files\7-Zip\7z.exe"
-            installed_winrar = r"C:\Program Files\WinRAR\WinRAR.exe"
-            
+            # Locate an available extractor (platform-aware)
             cmd = None
-            # Prioritize full installed 7-Zip because 7za (standalone) often fails on newer multi-volume RARs
-            if os.path.exists(installed_7z):
-                cmd = [installed_7z, 'x', first_vol, f'-o{save_dir}', '-y']
-            elif os.path.exists(installed_winrar):
-                cmd = [installed_winrar, 'x', '-y', first_vol, f'{save_dir}\\']
-            elif os.path.exists(bundled_7z):
-                cmd = [bundled_7z, 'x', first_vol, f'-o{save_dir}', '-y']
+            if sys.platform == 'win32':
+                # Windows: prefer installed 7-Zip > WinRAR > bundled 7z.exe
+                if hasattr(sys, '_MEIPASS'):
+                    bundled_7z = os.path.join(sys._MEIPASS, '7z.exe')
+                else:
+                    bundled_7z = os.path.join(os.path.dirname(os.path.abspath(__file__)), '7z.exe')
+                installed_7z = r"C:\Program Files\7-Zip\7z.exe"
+                installed_winrar = r"C:\Program Files\WinRAR\WinRAR.exe"
+                if os.path.exists(installed_7z):
+                    cmd = [installed_7z, 'x', first_vol, f'-o{save_dir}', '-y']
+                elif os.path.exists(installed_winrar):
+                    cmd = [installed_winrar, 'x', '-y', first_vol, f'{save_dir}\\']
+                elif os.path.exists(bundled_7z):
+                    cmd = [bundled_7z, 'x', first_vol, f'-o{save_dir}', '-y']
+            else:
+                # Linux / macOS: use system 7z from p7zip
+                linux_7z = '/usr/bin/7z'
+                if os.path.exists(linux_7z):
+                    cmd = [linux_7z, 'x', first_vol, f'-o{save_dir}', '-y']
                 
             if not cmd:
                 for t in tasks_in_folder:
-                    t.status = "Extract Error (Missing 7z.exe)"
+                    t.status = "Extract Error (No extractor found)"
                 if folder_name in self.extracted_folders:
                     self.extracted_folders.remove(folder_name)
                 return
                 
-            # Run extraction silently without spawning a console window
-            creationflags = 0x08000000 # subprocess.CREATE_NO_WINDOW
+            # Run extraction silently without spawning a console window (Windows only)
+            creationflags = 0x08000000 if sys.platform == 'win32' else 0
             subprocess.run(
-                cmd, 
-                check=True, 
+                cmd,
+                check=True,
                 creationflags=creationflags,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

@@ -1,4 +1,4 @@
-# SilverSpoon
+# SilverSpoon (previously FitGirlDownloader)
 
 > **Note:** Currently, this tool ONLY supports `fuckingfast.co` links (often used by FitGirl Repacks). Support for other hosts may be added in the future.
 

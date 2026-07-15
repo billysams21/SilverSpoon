@@ -632,17 +632,17 @@ class MainWindow(QMainWindow):
 
     def show_about_dialog(self):
         QMessageBox.about(self, "About SilverSpoon",
-            "<h3>SilverSpoon v1.2.0</h3>"
+            "<h3>SilverSpoon v1.2.1</h3>"
             "<p>A simple, fast bulk downloader for FuckingFast links.</p>"
             "<p>Select your links, paste them in, and hit Add!</p>"
+            "<p>Licensed under the GNU GPLv3.</p>"
             "<hr>"
-            "<h4>Changelog (v1.2.0 - Short):</h4>"
+            "<h4>Changelog (v1.2.1 - Short):</h4>"
             "<ul>"
-            "<li><b>New:</b> Persistent download history and custom column sizing.</li>"
-            "<li><b>New:</b> Batch folders with collapsible tree UI.</li>"
-            "<li><b>New:</b> Live global speed tracking and ETAs.</li>"
-            "<li><b>New:</b> Delete button/key to trash files and tasks.</li>"
-            "<li><b>New:</b> 'Retry' and 'Paste from Clipboard' buttons.</li>"
+            "<li><b>New:</b> Right-click context menu and keyboard shortcuts.</li>"
+            "<li><b>New:</b> Force Redownload action.</li>"
+            "<li><b>New:</b> Hover error tooltips and 'Copy Error Details' log extraction.</li>"
+            "<li><b>New:</b> Extraction support for Linux and macOS.</li>"
             "</ul>"
             "<p><i>See CHANGELOG.md for full details.</i></p>"
         )

@@ -6,6 +6,10 @@ import re
 import subprocess
 import json
 import logging
+import tempfile
+import zipfile
+import shutil
+import datetime
 
 logging.basicConfig(
     filename=os.path.expanduser("~/.silverspoon.log"),
@@ -24,9 +28,37 @@ from PyQt6.QtGui import QAction, QDesktopServices, QIcon, QPixmap
 from PyQt6.QtCore import Qt, QTimer, QUrl, QEvent
 
 import cloudscraper
+from PyQt6.QtCore import QMetaObject, Q_ARG
+from update_logic import UpdateCheckerThread, UpdateDownloaderDialog
+
+CURRENT_VERSION = "v1.3.0"
+GITHUB_REPO = "billysams21/SilverSpoon"
+OLD_EXE_CLEANUP_MARKER_SUFFIX = ".delete_old_on_start"
 
 def get_settings_path():
     return os.path.expanduser("~/.silverspoon_settings.json")
+
+def remove_previous_executable_if_approved():
+    """
+    The old one-file PyInstaller process can still hold the renamed executable
+    for a few seconds after the replacement process starts. Returning False
+    lets the caller retry instead of leaving the marker forever.
+    """
+    if not hasattr(sys, '_MEIPASS'):
+        return True
+
+    old_exe = sys.executable + ".old"
+    cleanup_marker = sys.executable + OLD_EXE_CLEANUP_MARKER_SUFFIX
+    if not os.path.exists(cleanup_marker):
+        return True
+
+    try:
+        if os.path.exists(old_exe):
+            os.remove(old_exe)
+        os.remove(cleanup_marker)
+        return True
+    except OSError:
+        return False
 
 def load_settings():
     if sys.platform == "win32":
@@ -45,7 +77,8 @@ def load_settings():
         "extract_after_download": False,
         "column_widths": {},
         "skip_delete_confirmation": False,
-        "show_warning_dialog": True
+        "show_warning_dialog": True,
+        "last_update_check": 0.0
     }
     settings_path = get_settings_path()
     if os.path.exists(settings_path):
@@ -56,6 +89,10 @@ def load_settings():
                 default_settings.update(loaded)
         except Exception:
             pass
+            
+    # Explicitly save settings back so new defaults are written immediately
+    save_settings(default_settings)
+    
     return default_settings
 
 def save_settings(settings):
@@ -219,7 +256,8 @@ class SettingsDialog(QDialog):
             "extract_after_download": self.extract_checkbox.isChecked(),
             "skip_delete_confirmation": self.skip_delete_checkbox.isChecked(),
             "column_widths": self.current_settings.get("column_widths", {}),
-            "show_warning_dialog": self.current_settings.get("show_warning_dialog", True)
+            "show_warning_dialog": self.current_settings.get("show_warning_dialog", True),
+            "last_update_check": self.current_settings.get("last_update_check", 0.0)
         }
 
 class DownloadTask:
@@ -338,6 +376,13 @@ class MainWindow(QMainWindow):
         if self.settings.get("show_warning_dialog", True):
             QTimer.singleShot(100, self.show_warning_dialog)
             
+        # Start Update Checker
+        if sys.platform == "win32" and hasattr(sys, 'frozen'):
+            self.update_checker = UpdateCheckerThread(CURRENT_VERSION, GITHUB_REPO, get_settings_path())
+            self.update_checker.update_available.connect(self.prompt_update)
+            self.update_checker.check_finished.connect(self.update_last_check_time)
+            self.update_checker.start()
+            
         # Start Background Download Manager
         self.manager_thread = threading.Thread(target=self.download_manager, daemon=True)
         self.manager_thread.start()
@@ -401,6 +446,10 @@ class MainWindow(QMainWindow):
         welcome_action = QAction("&Welcome", self)
         welcome_action.triggered.connect(self.show_warning_dialog_manual)
         help_menu.addAction(welcome_action)
+        
+        check_update_action = QAction("Check for &Updates...", self)
+        check_update_action.triggered.connect(self.manual_update_check)
+        help_menu.addAction(check_update_action)
 
         about_action = QAction("&About", self)
         about_action.triggered.connect(self.show_about_dialog)
@@ -777,6 +826,203 @@ class MainWindow(QMainWindow):
         dialog.dont_show_checkbox.setChecked(not self.settings.get("show_warning_dialog", True))
         dialog.exec()
         save_settings(self.settings)
+
+    def manual_update_check(self):
+        self.manual_checker = UpdateCheckerThread(CURRENT_VERSION, GITHUB_REPO, get_settings_path(), force=True)
+        self.manual_checker.update_available.connect(self.prompt_update)
+        self.manual_checker.check_finished.connect(self.update_last_check_time)
+        self.manual_checker.no_update_found.connect(lambda: QMessageBox.information(self, "Up to date", "You are already using the latest version of SilverSpoon!"))
+        self.manual_checker.error_checking.connect(lambda err: QMessageBox.warning(self, "Update Check Failed", f"Could not check for updates:\n{err}"))
+        self.manual_checker.start()
+        
+    def update_last_check_time(self, timestamp):
+        self.settings["last_update_check"] = timestamp
+        save_settings(self.settings)
+        self.settings = load_settings()
+        
+    def prompt_update(self, version, changelog, download_url):
+        # First verify write permission in the current directory
+        current_exe_dir = os.path.dirname(sys.executable)
+        test_file = os.path.join(current_exe_dir, ".update_test_permission")
+        try:
+            with open(test_file, 'w') as f:
+                f.write("test")
+            os.remove(test_file)
+        except PermissionError:
+            QMessageBox.warning(
+                self, "Update Available (Admin Required)",
+                f"Version {version} is available!\n\n"
+                f"However, SilverSpoon is located in a protected folder:\n{current_exe_dir}\n\n"
+                "Please run SilverSpoon as Administrator to update automatically, or move it to a normal folder like Downloads or Desktop."
+            )
+            return
+        except Exception:
+            pass
+            
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Update Available: {version}")
+        dialog.setMinimumWidth(500)
+        
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"<b>A new version ({version}) is available!</b>"))
+        
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setMarkdown(changelog)
+        layout.addWidget(text_edit)
+        
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Yes | QDialogButtonBox.StandardButton.No)
+        btn_box.button(QDialogButtonBox.StandardButton.Yes).setText("Download and Restart")
+        btn_box.accepted.connect(dialog.accept)
+        btn_box.rejected.connect(dialog.reject)
+        layout.addWidget(btn_box)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.execute_update(download_url)
+            
+    def execute_update(self, download_url):
+        dl_dialog = UpdateDownloaderDialog(download_url, self)
+        if dl_dialog.exec() == QDialog.DialogCode.Accepted:
+            zip_path = dl_dialog.temp_zip
+            extract_dir = os.path.join(tempfile.gettempdir(), f"silverspoon_extract_{int(time.time())}")
+            
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(extract_dir)
+                    
+                new_exe_path = None
+                for root, _, files in os.walk(extract_dir):
+                    for file in files:
+                        if file.lower() == "silverspoon.exe":
+                            new_exe_path = os.path.join(root, file)
+                            break
+                            
+                if not new_exe_path:
+                    raise Exception("Could not find SilverSpoon.exe inside the downloaded zip.")
+                    
+                current_exe = sys.executable
+                current_exe_name = os.path.basename(current_exe)
+                
+                if not current_exe_name.lower().startswith("silverspoon"):
+                    msg_box = QMessageBox(self)
+                    msg_box.setWindowTitle("Update Downloaded (Manual Action Required)")
+                    msg_box.setText(
+                        f"The update has been downloaded and extracted to:\n{extract_dir}\n\n"
+                        "Because you are running SilverSpoon from a differently named executable or script, "
+                        "the automatic replacement was aborted to keep you safe."
+                    )
+                    
+                    copy_btn = msg_box.addButton("Copy Directory Path", QMessageBox.ButtonRole.ActionRole)
+                    ok_btn = msg_box.addButton(QMessageBox.StandardButton.Ok)
+                    msg_box.setDefaultButton(ok_btn)
+                    
+                    msg_box.exec()
+                    
+                    if msg_box.clickedButton() == copy_btn:
+                        QApplication.clipboard().setText(extract_dir)
+                        QMessageBox.information(self, "Copied", "Directory path copied to clipboard.")
+                        
+                    return
+                
+                # Option 2: The Rename Trick
+                old_exe_path = current_exe + ".old"
+                
+                # If an old leftover exists from a previous update, try to remove it
+                if os.path.exists(old_exe_path):
+                    try:
+                        os.remove(old_exe_path)
+                    except Exception:
+                        pass
+                
+                # Rename current running executable
+                os.rename(current_exe, old_exe_path)
+                
+                # Copy the newly downloaded executable into place (avoids WinError 32 if Temp file is locked by AV)
+                copy_success = False
+                for _ in range(10):
+                    try:
+                        shutil.copy2(new_exe_path, current_exe)
+                        copy_success = True
+                        break
+                    except PermissionError:
+                        time.sleep(0.5)
+                        
+                if not copy_success:
+                    # Rollback the rename if we couldn't copy the new file in
+                    os.rename(old_exe_path, current_exe)
+                    raise Exception("Could not copy the new executable. It might be locked by your Antivirus.")
+                
+                # Cleanup the extracted temp dir and zip file
+                try:
+                    shutil.rmtree(extract_dir, ignore_errors=True)
+                    if os.path.exists(zip_path):
+                        os.remove(zip_path)
+                except Exception:
+                    pass
+
+                # Keep the renamed executable as a rollback copy unless the user
+                # explicitly chooses to remove it. The marker is consumed by the
+                # replacement app only after it has started successfully.
+                delete_old_exe = QMessageBox.question(
+                    self,
+                    "Remove Previous Version?",
+                    "The previous version is saved as:\n"
+                    f"{old_exe_path}\n\n"
+                    "Delete this backup after the new version closes normally?\n"
+                    "It will be kept if the replacement cannot start.\n"
+                    "Choose No to keep it for rollback.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                ) == QMessageBox.StandardButton.Yes
+                cleanup_marker = current_exe + OLD_EXE_CLEANUP_MARKER_SUFFIX
+                if delete_old_exe:
+                    with open(cleanup_marker, "w", encoding="utf-8") as marker:
+                        marker.write("Delete the previous executable after a successful restart.\n")
+                elif os.path.exists(cleanup_marker):
+                    os.remove(cleanup_marker)
+
+                # Save state before we exit
+                save_history(self.tasks)
+                save_settings(self.settings)
+                
+                # Write a .bat trampoline that:
+                # 1. Tells PyInstaller that this is a fresh application instance.
+                # 2. Waits for the old process to fully exit.
+                # 3. Waits for the replacement executable to exit normally.
+                # 4. Deletes the approved backup, then removes itself.
+                #
+                # PyInstaller 6 treats a process launched from a frozen app as a
+                # worker by default. A worker reuses the parent's _MEI directory,
+                # which is deleted as this process exits and makes the replacement
+                # fail to load python313.dll. PYINSTALLER_RESET_ENVIRONMENT is the
+                # supported way to force a new one-file extraction directory.
+                bat_path = os.path.join(tempfile.gettempdir(), f"silverspoon_restart_{int(time.time())}.bat")
+                with open(bat_path, 'w') as bat:
+                    bat.write('@echo off\n')
+                    bat.write('set PYINSTALLER_RESET_ENVIRONMENT=1\n')
+                    # Kept for compatibility with builds made by older PyInstaller.
+                    bat.write('set _MEIPASS=\n')
+                    bat.write('set _MEIPASS2=\n')
+                    bat.write('ping 127.0.0.1 -n 4 > nul\n')
+                    bat.write(f'start "" /wait "{current_exe}"\n')
+                    bat.write('if errorlevel 1 goto cleanup\n')
+                    bat.write(f'if exist "{cleanup_marker}" del /f /q "{old_exe_path}" > nul 2>&1\n')
+                    bat.write(f'if not exist "{old_exe_path}" if exist "{cleanup_marker}" del /q "{cleanup_marker}" > nul 2>&1\n')
+                    bat.write(':cleanup\n')
+                    bat.write(f'del "%~f0"\n')
+                
+                CREATE_NO_WINDOW = 0x08000000
+                subprocess.Popen(
+                    [bat_path],
+                    creationflags=CREATE_NO_WINDOW,
+                    close_fds=True
+                )
+                
+                QApplication.quit()
+                sys.exit(0)
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Update Failed", f"Failed to apply the update:\n{str(e)}")
 
     def open_settings_dialog(self):
         dialog = SettingsDialog(self.settings, self)
@@ -1466,36 +1712,30 @@ class MainWindow(QMainWindow):
                 last_time = start_time
                 bytes_since_last = 0
                 
-                try:
-                    with open(task.filepath, mode) as f:
-                        for chunk in r.iter_content(chunk_size=8192*8):
-                            if task.pause_flag:
-                                task.status = "Paused"
-                                task.speed = 0
-                                return
-                            if task.cancel_flag:
-                                task.status = "Cancelled"
-                                task.speed = 0
-                                return
-                                
-                            if chunk:
-                                f.write(chunk)
-                                size = len(chunk)
-                                task.downloaded_bytes += size
-                                bytes_since_last += size
-                                
-                                now = time.time()
-                                if now - last_time > 0.5:
-                                    task.speed = (bytes_since_last / (now - last_time)) / (1024*1024)
-                                    if task.total_bytes > 0:
-                                        task.progress = (task.downloaded_bytes / task.total_bytes) * 100
-                                    last_time = now
-                                    bytes_since_last = 0
-                except Exception as e:
-                    task.status = "Error"
-                    task.error_message = f"Failed to open or write to file '{task.filepath}'. Check disk space and permissions. {format_error_message(e)}"
-                    self.trigger_history_save()
-                    return
+                with open(task.filepath, mode) as f:
+                    for chunk in r.iter_content(chunk_size=8192*8):
+                        if task.pause_flag:
+                            task.status = "Paused"
+                            task.speed = 0
+                            return
+                        if task.cancel_flag:
+                            task.status = "Cancelled"
+                            task.speed = 0
+                            return
+                            
+                        if chunk:
+                            f.write(chunk)
+                            size = len(chunk)
+                            task.downloaded_bytes += size
+                            bytes_since_last += size
+                            
+                            now = time.time()
+                            if now - last_time > 0.5:
+                                task.speed = (bytes_since_last / (now - last_time)) / (1024*1024)
+                                if task.total_bytes > 0:
+                                    task.progress = (task.downloaded_bytes / task.total_bytes) * 100
+                                last_time = now
+                                bytes_since_last = 0
                 
                 task.progress = 100
                 task.speed = 0
@@ -1516,6 +1756,25 @@ if __name__ == "__main__":
     # Determine base directory for assets
     if hasattr(sys, '_MEIPASS'):
         base_dir = sys._MEIPASS
+        
+        # Delete the previous executable only when the user approved it during
+        # the update. The old process can briefly keep it locked, so retry for
+        # up to 20 seconds after the replacement has started.
+        def retry_previous_executable_cleanup(retries_left=20):
+            if remove_previous_executable_if_approved():
+                return
+            if retries_left <= 0:
+                logging.error(
+                    "Could not remove the previous executable after restarting; "
+                    "it will be retried the next time SilverSpoon starts."
+                )
+                return
+            QTimer.singleShot(
+                1000,
+                lambda: retry_previous_executable_cleanup(retries_left - 1)
+            )
+
+        retry_previous_executable_cleanup()
     else:
         base_dir = os.path.dirname(os.path.abspath(__file__))
         

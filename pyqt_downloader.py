@@ -9,7 +9,6 @@ import logging
 import tempfile
 import zipfile
 import shutil
-import datetime
 
 logging.basicConfig(
     filename=os.path.expanduser("~/.silverspoon.log"),
@@ -37,28 +36,6 @@ OLD_EXE_CLEANUP_MARKER_SUFFIX = ".delete_old_on_start"
 
 def get_settings_path():
     return os.path.expanduser("~/.silverspoon_settings.json")
-
-def remove_previous_executable_if_approved():
-    """
-    The old one-file PyInstaller process can still hold the renamed executable
-    for a few seconds after the replacement process starts. Returning False
-    lets the caller retry instead of leaving the marker forever.
-    """
-    if not hasattr(sys, '_MEIPASS'):
-        return True
-
-    old_exe = sys.executable + ".old"
-    cleanup_marker = sys.executable + OLD_EXE_CLEANUP_MARKER_SUFFIX
-    if not os.path.exists(cleanup_marker):
-        return True
-
-    try:
-        if os.path.exists(old_exe):
-            os.remove(old_exe)
-        os.remove(cleanup_marker)
-        return True
-    except OSError:
-        return False
 
 def load_settings():
     if sys.platform == "win32":
@@ -1756,25 +1733,6 @@ if __name__ == "__main__":
     # Determine base directory for assets
     if hasattr(sys, '_MEIPASS'):
         base_dir = sys._MEIPASS
-        
-        # Delete the previous executable only when the user approved it during
-        # the update. The old process can briefly keep it locked, so retry for
-        # up to 20 seconds after the replacement has started.
-        def retry_previous_executable_cleanup(retries_left=20):
-            if remove_previous_executable_if_approved():
-                return
-            if retries_left <= 0:
-                logging.error(
-                    "Could not remove the previous executable after restarting; "
-                    "it will be retried the next time SilverSpoon starts."
-                )
-                return
-            QTimer.singleShot(
-                1000,
-                lambda: retry_previous_executable_cleanup(retries_left - 1)
-            )
-
-        retry_previous_executable_cleanup()
     else:
         base_dir = os.path.dirname(os.path.abspath(__file__))
         

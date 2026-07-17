@@ -1,15 +1,29 @@
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, QMetaObject, Qt, Q_ARG
-from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QProgressBar, QMessageBox, QApplication, QTextEdit, QHBoxLayout, QPushButton
+from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QProgressBar, QMessageBox
 import sys
 import os
 import time
 import json
 import urllib.request
 import tempfile
-import zipfile
-import subprocess
-import shutil
 import threading
+import re
+
+_VERSION_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(.*)$", re.IGNORECASE)
+
+def version_key(version):
+    match = _VERSION_PATTERN.fullmatch(version.strip())
+    if not match:
+        return None
+
+    major, minor, patch, suffix = match.groups()
+    # major > minor > patch; patch + suffix > patch
+    return int(major), int(minor), int(patch), bool(suffix), suffix.casefold()
+
+def is_newer_version(latest_version, current_version):
+    latest_key = version_key(latest_version)
+    current_key = version_key(current_version)
+    return latest_key is not None and current_key is not None and latest_key > current_key
 
 class UpdateCheckerThread(QThread):
     update_available = pyqtSignal(str, str, str) # version, changelog, download_url
@@ -68,7 +82,7 @@ class UpdateCheckerThread(QThread):
             
             latest_version = data.get("tag_name", "")
             
-            if latest_version and latest_version > self.current_version:
+            if latest_version and is_newer_version(latest_version, self.current_version):
                 assets = data.get("assets", [])
                 download_url = None
                 for asset in assets:
@@ -110,16 +124,16 @@ class UpdateDownloaderDialog(QDialog):
         self.progress_bar.setRange(0, 100)
         layout.addWidget(self.progress_bar)
         
-        self.worker = threading.Thread(target=self.download_update, daemon=True)
-        self.worker.start()
-        
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.check_worker)
-        self.timer.start(100)
-        
         self.error = None
         self.temp_zip = None
         self.finished = False
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.check_worker)
+        self.timer.start(100)
+
+        self.worker = threading.Thread(target=self.download_update, daemon=True)
+        self.worker.start()
 
     def check_worker(self):
         if self.finished:

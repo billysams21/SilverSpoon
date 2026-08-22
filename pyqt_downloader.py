@@ -2910,7 +2910,11 @@ class MainWindow(QMainWindow):
         dl_url = self.get_direct_link(task)
         if not dl_url:
             if not task.cancel_flag and not task.pause_flag:
-                if self.settings.get("auto_retry_errors", False) and task.retry_count < 3:
+                # Don't auto-retry a CAPTCHA timeout: re-solving immediately just
+                # respawns the browser and rarely succeeds.
+                if (self.settings.get("auto_retry_errors", False)
+                        and task.retry_count < 3
+                        and task.status != "CAPTCHA Timeout"):
                     task.retry_count += 1
                     task.status = "Pending"
                     task.error_message = ""

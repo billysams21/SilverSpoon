@@ -358,7 +358,18 @@ class TurnstileSolver:
             return {"direct_url": direct_url, "cookies": cookies, "user_agent": user_agent}
 
     def get_direct_link(self, link):
-        return self._submit(self._resolve_direct_link_async(link))
+        return self._submit(self._resolve_with_cleanup(link))
+
+    async def _resolve_with_cleanup(self, link):
+        try:
+            return await self._resolve_direct_link_async(link)
+        except Exception:
+            # Any failed resolution tears the browser down so a broken instance
+            # is never reused — reuse was causing repeated browser re-spawns that
+            # never reached the download page.
+            async with self._browser_lock:
+                await self._close_browser()
+            raise
 
     @property
     def user_agent(self):

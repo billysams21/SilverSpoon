@@ -1832,8 +1832,10 @@ class MainWindow(QMainWindow):
                 "The downloaded update file is missing. Please download it again.")
 
     def _make_update_task(self, version, download_url):
-        updates_dir = os.path.expanduser("~/.silverspoon_updates")
-        task = DownloadTask(download_url, updates_dir, f"SilverSpoon Update {version}")
+        # Download to the visible Save-To directory, like every other download,
+        # so the user can find it (and it persists for an install-on-next-open).
+        base_dir = os.path.abspath(self.dir_input.text())
+        task = DownloadTask(download_url, base_dir, f"SilverSpoon Update {version}")
         task.is_update = True
         task.update_version = version
         task.is_selected = True

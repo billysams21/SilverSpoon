@@ -342,16 +342,22 @@ class ModernTaskDelegate(QStyledItemDelegate):
                 painter.setFont(font)
                 metrics = painter.fontMetrics()
                 text_w = metrics.horizontalAdvance(status_text)
-                
-                tag_w = text_w + 10
+
+                # Clamp the pill to the column so it never overflows into the
+                # next column; elide the label (e.g. "Solving CAPTCHA...") if it
+                # doesn't fit the available width.
+                max_tag_w = max(24, rect.width() - 6)
+                tag_w = min(text_w + 12, max_tag_w)
                 tag_rect = QRectF(rect.x() + 2, tag_y, tag_w, tag_height)
 
                 painter.setBrush(QBrush(bg_color))
                 painter.setPen(QPen(border_color, 1))
                 painter.drawRoundedRect(tag_rect, 2, 2)
 
+                elided = metrics.elidedText(
+                    status_text, Qt.TextElideMode.ElideRight, int(tag_w) - 8)
                 painter.setPen(text_color)
-                painter.drawText(tag_rect, Qt.AlignmentFlag.AlignCenter, status_text)
+                painter.drawText(tag_rect, Qt.AlignmentFlag.AlignCenter, elided)
                 painter.restore()
                 return
 

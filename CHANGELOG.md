@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixes & Improvements
+* **Updates download in the queue (no more crash):** The auto-updater no longer uses a separate modal downloader (which could crash mid-download on large releases). A new version is now added to your normal download queue — start it when you like, and pause/resume it like any other download. When it finishes, choose **Install now** (restart) or **Install on next open**; a deferred update is offered again the next time you launch. Update downloads skip the Cloudflare/CAPTCHA step and are never auto-extracted.
+
 ## [v1.5.0] - 2026-08-21
 
 ### New Features

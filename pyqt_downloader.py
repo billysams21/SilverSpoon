@@ -11,6 +11,8 @@ import contextlib
 import zipfile
 import shutil
 import uuid
+import urllib.request
+import urllib.error
 from collections import deque
 
 logging.basicConfig(
@@ -426,7 +428,7 @@ ProgressBarDelegate = ModernTaskDelegate
 from curl_cffi import requests as curl_requests
 from cf_turnstile import TurnstileSolver
 from PyQt6.QtCore import QMetaObject, Q_ARG
-from update_logic import UpdateCheckerThread, UpdateDownloaderDialog
+from update_logic import UpdateCheckerThread
 import datetime as _dt
 import scheduler as offpeak
 from ui_style import button_style
@@ -927,6 +929,11 @@ class DownloadTask:
         self.tree_item = None
         self.is_selected = False
 
+        # App-update tasks download a plain URL (no CAPTCHA/direct-link step)
+        # and, once complete, offer to install instead of being extracted.
+        self.is_update = False
+        self.update_version = None
+
     def to_dict(self):
         return {
             "uid": self.uid,
@@ -937,7 +944,9 @@ class DownloadTask:
             "error_message": self.error_message,
             "downloaded_bytes": self.downloaded_bytes,
             "total_bytes": self.total_bytes,
-            "progress": self.progress
+            "progress": self.progress,
+            "is_update": self.is_update,
+            "update_version": self.update_version
         }
         
     @classmethod
@@ -958,6 +967,8 @@ class DownloadTask:
         task.total_bytes = data.get("total_bytes", 0)
         task.progress = data.get("progress", 0.0)
         task.error_message = data.get("error_message", "")
+        task.is_update = data.get("is_update", False)
+        task.update_version = data.get("update_version")
         return task
 
 def get_history_path():
@@ -1047,6 +1058,9 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(1500, self.scheduler_tick)
 
         self._refresh_schedule_indicator()
+
+        # Offer to finish installing an update that was deferred to "next open".
+        QTimer.singleShot(1200, self._check_pending_update)
 
     def closeEvent(self, event):
         save_history(self.tasks)
@@ -1653,31 +1667,57 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
             
+        # Don't queue the same version twice — but re-offer if the previous try
+        # failed/was cancelled, or its downloaded file is gone.
+        for t in self.tasks:
+            if (getattr(t, "is_update", False) and t.update_version == version
+                    and t.status not in ("Error", "Cancelled")
+                    and os.path.exists(t.filepath)):
+                return
+
+        # Add the update to the normal download queue so it downloads through the
+        # proven engine (pause/resume/Range-resume) instead of a fragile modal
+        # downloader. The user starts it like any other task; on completion it
+        # offers to install now or on next launch.
+        task = self._make_update_task(version, download_url)
+        self.add_task_to_ui(task)
+
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Update Available: {version}")
         dialog.setMinimumWidth(500)
-        
+
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel(f"<b>A new version ({version}) is available!</b>"))
-        
+        layout.addWidget(QLabel(
+            f'Added to your download queue as "<b>{task.folder_name}</b>". '
+            "Start it now or later — you can pause and resume it like any "
+            "other download."))
+
         text_edit = QTextEdit()
         text_edit.setReadOnly(True)
         text_edit.setMarkdown(changelog)
         layout.addWidget(text_edit)
-        
+
         btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Yes | QDialogButtonBox.StandardButton.No)
-        btn_box.button(QDialogButtonBox.StandardButton.Yes).setText("Download and Restart")
+        btn_box.button(QDialogButtonBox.StandardButton.Yes).setText("Start download now")
+        btn_box.button(QDialogButtonBox.StandardButton.No).setText("I'll start it later")
         btn_box.accepted.connect(dialog.accept)
         btn_box.rejected.connect(dialog.reject)
         layout.addWidget(btn_box)
-        
+
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.execute_update(download_url)
+            task.status = "Pending"
+            task.error_message = ""
+            task.cancel_flag = False
+            task.pause_flag = False
             
-    def execute_update(self, download_url):
-        dl_dialog = UpdateDownloaderDialog(download_url, self)
-        if dl_dialog.exec() == QDialog.DialogCode.Accepted:
-            zip_path = dl_dialog.temp_zip
+    def _apply_downloaded_update(self, zip_path, version=None):
+        # Apply an already-downloaded release zip: extract it, then hand off to a
+        # batch script that swaps the app directory and restarts (same robust
+        # move -> robocopy -> marker-verify -> rollback flow as before).
+        self.settings.pop("pending_update", None)
+        save_settings(self.settings)
+        if zip_path and os.path.exists(zip_path):
             extract_dir = os.path.join(tempfile.gettempdir(), f"silverspoon_extract_{int(time.time())}")
             
             try:
@@ -1787,6 +1827,74 @@ class MainWindow(QMainWindow):
                 
             except Exception as e:
                 QMessageBox.critical(self, "Update Failed", f"Failed to apply the update:\n{str(e)}")
+        else:
+            QMessageBox.warning(
+                self, "Update",
+                "The downloaded update file is missing. Please download it again.")
+
+    def _make_update_task(self, version, download_url):
+        # Download to the visible Save-To directory, like every other download,
+        # so the user can find it (and it persists for an install-on-next-open).
+        base_dir = os.path.abspath(self.dir_input.text())
+        task = DownloadTask(download_url, base_dir, f"SilverSpoon Update {version}")
+        task.is_update = True
+        task.update_version = version
+        task.is_selected = True
+        return task
+
+    def _check_update_task_done(self):
+        """When a queued update download finishes, offer to install it. Skips a
+        version already deferred to next-open so it isn't prompted twice."""
+        pending_v = (self.settings.get("pending_update") or {}).get("version")
+        for t in self.tasks:
+            if (getattr(t, "is_update", False) and t.status == "Completed"
+                    and not getattr(t, "_install_handled", False)
+                    and t.update_version != pending_v
+                    and os.path.exists(t.filepath)):
+                t._install_handled = True
+                self._prompt_install(t)
+
+    def _prompt_install(self, task):
+        box = QMessageBox(self)
+        box.setWindowTitle("Update Downloaded")
+        box.setText(
+            f"SilverSpoon {task.update_version} has finished downloading.\n\n"
+            "Install it now (the app will restart), or on the next launch?")
+        now_btn = box.addButton("Install now", QMessageBox.ButtonRole.AcceptRole)
+        later_btn = box.addButton("Install on next open", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("Not yet", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(now_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == now_btn:
+            self._apply_downloaded_update(task.filepath, task.update_version)
+        elif clicked == later_btn:
+            self.settings["pending_update"] = {
+                "zip": task.filepath, "version": task.update_version}
+            save_settings(self.settings)
+            QMessageBox.information(
+                self, "Update Scheduled",
+                f"SilverSpoon {task.update_version} will be installed the next "
+                "time you open the app.")
+
+    def _check_pending_update(self):
+        """On startup, offer to install an update that was deferred earlier."""
+        pending = self.settings.get("pending_update")
+        if not pending:
+            return
+        zip_path, version = pending.get("zip"), pending.get("version")
+        if not zip_path or not os.path.exists(zip_path):
+            self.settings.pop("pending_update", None)
+            save_settings(self.settings)
+            return
+        reply = QMessageBox.question(
+            self, "Install Update",
+            f"SilverSpoon {version} was downloaded earlier and is ready to "
+            "install.\n\nInstall it now? The app will restart.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self._apply_downloaded_update(zip_path, version)
+        # If No, keep pending_update so it asks again next open.
 
     def open_settings_dialog(self):
         dialog = SettingsDialog(self.settings, self)
@@ -2475,7 +2583,9 @@ class MainWindow(QMainWindow):
             # Store the progress and status in the item's data for the custom delegate to paint
             batch_item.setData(0, Qt.ItemDataRole.UserRole, prog)
             batch_item.setData(1, Qt.ItemDataRole.UserRole, batch_status)
-            
+
+        self._check_update_task_done()
+
     def download_manager(self):
         while True:
             # CAPTCHA resolution belongs to the same worker slot as the actual
@@ -2536,7 +2646,11 @@ class MainWindow(QMainWindow):
         for folder_name, tasks_in_folder in folders.items():
             if folder_name in self.extracted_folders:
                 continue
-                
+
+            # Never auto-extract an app-update download.
+            if any(getattr(t, "is_update", False) for t in tasks_in_folder):
+                continue
+
             valid_extraction_statuses = {"Completed", "Extracted", "Extracting..."}
             if tasks_in_folder and all(t.status in valid_extraction_statuses for t in tasks_in_folder):
                 if all(t.status == "Extracted" for t in tasks_in_folder):
@@ -2687,7 +2801,110 @@ class MainWindow(QMainWindow):
             task.error_message = "Could not get the direct download link. The link may be expired or blocked."
         return None
 
+    def _download_update_file(self, task):
+        """Download an app-update file via urllib (stdlib), with resume,
+        pause/cancel and progress. Kept off the shared curl_cffi session, which
+        hangs (curl 28) for a manager-spawned worker that skips get_direct_link."""
+        try:
+            os.makedirs(task.save_dir, exist_ok=True)
+        except Exception as e:
+            task.status = "Error"
+            task.error_message = (
+                f"Failed to create update folder '{task.save_dir}'. "
+                f"{format_error_message(e)}")
+            self.trigger_history_save()
+            return
+
+        initial_size = os.path.getsize(task.filepath) if os.path.exists(task.filepath) else 0
+        req = urllib.request.Request(
+            task.link, headers={"User-Agent": f"SilverSpoon-Updater/{CURRENT_VERSION}"})
+        if initial_size > 0:
+            req.add_header("Range", f"bytes={initial_size}-")
+
+        task.status = "Downloading"
+        task.error_message = ""
+        try:
+            with contextlib.closing(urllib.request.urlopen(req, timeout=30)) as r:
+                status = getattr(r, "status", 200) or 200
+                content_range = r.headers.get("Content-Range")
+                content_length = r.headers.get("Content-Length")
+                if status == 206 and content_range:
+                    m = re.search(r'/([0-9]+)$', content_range)
+                    task.total_bytes = int(m.group(1)) if m else 0
+                    mode = "ab"
+                else:
+                    # Server ignored Range (or none asked) -> full body, restart.
+                    task.total_bytes = int(content_length) if content_length else 0
+                    initial_size = 0
+                    mode = "wb"
+                task.downloaded_bytes = initial_size
+
+                now = time.time()
+                samples = deque([(now, task.downloaded_bytes)])
+                with open(task.filepath, mode) as f:
+                    while True:
+                        if task.pause_flag:
+                            task.status = "Paused"; task.speed = 0; return
+                        if task.cancel_flag:
+                            task.status = "Cancelled"; task.speed = 0; return
+                        chunk = r.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        task.downloaded_bytes += len(chunk)
+                        now = time.time()
+                        samples.append((now, task.downloaded_bytes))
+                        while len(samples) > 1 and now - samples[0][0] > 3:
+                            samples.popleft()
+                        w0t, w0b = samples[0]
+                        dur = now - w0t
+                        if dur > 0:
+                            task.speed = ((task.downloaded_bytes - w0b) / dur) / (1024 * 1024)
+                        if task.total_bytes > 0:
+                            task.progress = (task.downloaded_bytes / task.total_bytes) * 100
+
+            task.progress = 100
+            task.speed = 0
+            task.status = "Completed"
+            task.error_message = ""
+            self.trigger_history_save()
+        except urllib.error.HTTPError as he:
+            if he.code == 416 and initial_size > 0:
+                # Range not satisfiable -> the file is already fully downloaded.
+                task.total_bytes = initial_size
+                task.downloaded_bytes = initial_size
+                task.progress = 100
+                task.speed = 0
+                task.status = "Completed"
+                task.error_message = ""
+                self.trigger_history_save()
+                return
+            self._update_download_failed(task, he)
+        except Exception as e:
+            self._update_download_failed(task, e)
+
+    def _update_download_failed(self, task, exc):
+        logging.error("Update download error for %s: %s", task.link, exc, exc_info=True)
+        if task.cancel_flag or task.pause_flag:
+            return
+        if self.settings.get("auto_retry_errors", False) and task.retry_count < 3:
+            task.retry_count += 1
+            task.status = "Pending"
+            task.error_message = ""
+        else:
+            task.status = "Error"
+            task.error_message = f"Update download failed. {format_error_message(exc)}"
+        self.trigger_history_save()
+
     def download_worker(self, task):
+        if getattr(task, "is_update", False):
+            # App updates are plain, direct URLs downloaded via urllib (stdlib).
+            # The shared curl_cffi session hangs (curl 28) when a manager-spawned
+            # worker uses it for a request that never went through the
+            # nodriver/get_direct_link path first; urllib is unaffected.
+            self._download_update_file(task)
+            return
+
         dl_url = self.get_direct_link(task)
         if not dl_url:
             if not task.cancel_flag and not task.pause_flag:

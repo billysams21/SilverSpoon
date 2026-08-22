@@ -1667,11 +1667,12 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
             
-        # Don't queue the same version twice — but a previously failed/cancelled
-        # update shouldn't block re-offering it.
+        # Don't queue the same version twice — but re-offer if the previous try
+        # failed/was cancelled, or its downloaded file is gone.
         for t in self.tasks:
             if (getattr(t, "is_update", False) and t.update_version == version
-                    and t.status not in ("Error", "Cancelled")):
+                    and t.status not in ("Error", "Cancelled")
+                    and os.path.exists(t.filepath)):
                 return
 
         # Add the update to the normal download queue so it downloads through the
@@ -1848,7 +1849,8 @@ class MainWindow(QMainWindow):
         for t in self.tasks:
             if (getattr(t, "is_update", False) and t.status == "Completed"
                     and not getattr(t, "_install_handled", False)
-                    and t.update_version != pending_v):
+                    and t.update_version != pending_v
+                    and os.path.exists(t.filepath)):
                 t._install_handled = True
                 self._prompt_install(t)
 

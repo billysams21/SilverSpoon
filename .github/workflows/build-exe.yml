@@ -9,6 +9,8 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write   # required for the release-attach step to upload the zip
     steps:
       - uses: actions/checkout@v4
 
@@ -44,16 +46,14 @@ jobs:
       - name: Bundle Playwright Chromium into dist
         shell: pwsh
         run: |
-          $source = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'ms-playwright') -Directory -Filter 'chromium-*' |
-            Where-Object { $_.Name -notlike 'chromium_headless*' } |
-            Sort-Object Name -Descending |
-            ForEach-Object { Join-Path $_.FullName 'chrome-win64' } |
-            Where-Object { Test-Path (Join-Path $_ 'chrome.exe') } |
-            Select-Object -First 1
-          if (-not $source) {
-            Write-Error 'Playwright Chromium was not found under %LOCALAPPDATA%\ms-playwright.'
+          # Ask Playwright itself for the chromium executable path — robust across
+          # Playwright versions / Chrome-for-Testing layouts (the old glob broke).
+          $exe = (python -c "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); print(p.chromium.executable_path); p.stop()").Trim()
+          if (-not $exe -or -not (Test-Path $exe)) {
+            Write-Error "Playwright Chromium executable not found (got '$exe')."
             exit 1
           }
+          $source = Split-Path $exe -Parent   # the chrome-win64 dir holding chrome.exe
           $dest = 'dist\SilverSpoon\playwright-chromium'
           if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
           New-Item -ItemType Directory -Path $dest -Force | Out-Null

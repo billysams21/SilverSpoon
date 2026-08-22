@@ -11,6 +11,8 @@ import contextlib
 import zipfile
 import shutil
 import uuid
+import urllib.request
+import urllib.error
 from collections import deque
 
 logging.basicConfig(
@@ -1665,9 +1667,11 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
             
-        # Don't queue the same version twice.
+        # Don't queue the same version twice — but a previously failed/cancelled
+        # update shouldn't block re-offering it.
         for t in self.tasks:
-            if getattr(t, "is_update", False) and t.update_version == version:
+            if (getattr(t, "is_update", False) and t.update_version == version
+                    and t.status not in ("Error", "Cancelled")):
                 return
 
         # Add the update to the normal download queue so it downloads through the
@@ -2793,14 +2797,111 @@ class MainWindow(QMainWindow):
             task.error_message = "Could not get the direct download link. The link may be expired or blocked."
         return None
 
+    def _download_update_file(self, task):
+        """Download an app-update file via urllib (stdlib), with resume,
+        pause/cancel and progress. Kept off the shared curl_cffi session, which
+        hangs (curl 28) for a manager-spawned worker that skips get_direct_link."""
+        try:
+            os.makedirs(task.save_dir, exist_ok=True)
+        except Exception as e:
+            task.status = "Error"
+            task.error_message = (
+                f"Failed to create update folder '{task.save_dir}'. "
+                f"{format_error_message(e)}")
+            self.trigger_history_save()
+            return
+
+        initial_size = os.path.getsize(task.filepath) if os.path.exists(task.filepath) else 0
+        req = urllib.request.Request(
+            task.link, headers={"User-Agent": f"SilverSpoon-Updater/{CURRENT_VERSION}"})
+        if initial_size > 0:
+            req.add_header("Range", f"bytes={initial_size}-")
+
+        task.status = "Downloading"
+        task.error_message = ""
+        try:
+            with contextlib.closing(urllib.request.urlopen(req, timeout=30)) as r:
+                status = getattr(r, "status", 200) or 200
+                content_range = r.headers.get("Content-Range")
+                content_length = r.headers.get("Content-Length")
+                if status == 206 and content_range:
+                    m = re.search(r'/([0-9]+)$', content_range)
+                    task.total_bytes = int(m.group(1)) if m else 0
+                    mode = "ab"
+                else:
+                    # Server ignored Range (or none asked) -> full body, restart.
+                    task.total_bytes = int(content_length) if content_length else 0
+                    initial_size = 0
+                    mode = "wb"
+                task.downloaded_bytes = initial_size
+
+                now = time.time()
+                samples = deque([(now, task.downloaded_bytes)])
+                with open(task.filepath, mode) as f:
+                    while True:
+                        if task.pause_flag:
+                            task.status = "Paused"; task.speed = 0; return
+                        if task.cancel_flag:
+                            task.status = "Cancelled"; task.speed = 0; return
+                        chunk = r.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        task.downloaded_bytes += len(chunk)
+                        now = time.time()
+                        samples.append((now, task.downloaded_bytes))
+                        while len(samples) > 1 and now - samples[0][0] > 3:
+                            samples.popleft()
+                        w0t, w0b = samples[0]
+                        dur = now - w0t
+                        if dur > 0:
+                            task.speed = ((task.downloaded_bytes - w0b) / dur) / (1024 * 1024)
+                        if task.total_bytes > 0:
+                            task.progress = (task.downloaded_bytes / task.total_bytes) * 100
+
+            task.progress = 100
+            task.speed = 0
+            task.status = "Completed"
+            task.error_message = ""
+            self.trigger_history_save()
+        except urllib.error.HTTPError as he:
+            if he.code == 416 and initial_size > 0:
+                # Range not satisfiable -> the file is already fully downloaded.
+                task.total_bytes = initial_size
+                task.downloaded_bytes = initial_size
+                task.progress = 100
+                task.speed = 0
+                task.status = "Completed"
+                task.error_message = ""
+                self.trigger_history_save()
+                return
+            self._update_download_failed(task, he)
+        except Exception as e:
+            self._update_download_failed(task, e)
+
+    def _update_download_failed(self, task, exc):
+        logging.error("Update download error for %s: %s", task.link, exc, exc_info=True)
+        if task.cancel_flag or task.pause_flag:
+            return
+        if self.settings.get("auto_retry_errors", False) and task.retry_count < 3:
+            task.retry_count += 1
+            task.status = "Pending"
+            task.error_message = ""
+        else:
+            task.status = "Error"
+            task.error_message = f"Update download failed. {format_error_message(exc)}"
+        self.trigger_history_save()
+
     def download_worker(self, task):
         if getattr(task, "is_update", False):
-            # App updates are plain, direct URLs — no Cloudflare/CAPTCHA step.
-            dl_url = task.link
-            task._dl_cookies = {}
-            task._dl_user_agent = ""
-        else:
-            dl_url = self.get_direct_link(task)
+            # App updates are plain, direct URLs downloaded via urllib (stdlib).
+            # The shared curl_cffi session hangs (curl 28) when a manager-spawned
+            # worker uses it for a request that never went through the
+            # nodriver/get_direct_link path first; urllib is unaffected.
+            self._download_update_file(task)
+            return
+
+        dl_url = self.get_direct_link(task)
         if not dl_url:
             if not task.cancel_flag and not task.pause_flag:
                 if self.settings.get("auto_retry_errors", False) and task.retry_count < 3:

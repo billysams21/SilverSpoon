@@ -433,25 +433,10 @@ from update_logic import UpdateCheckerThread
 import datetime as _dt
 import scheduler as offpeak
 from ui_style import button_style
+from providers import needs_resolution, RESOLVER_HOSTS
 
 CURRENT_VERSION = "v1.5.0"
 GITHUB_REPO = "billysams21/SilverSpoon"
-
-# Hosts that hide the file behind a Cloudflare/Turnstile challenge and need the
-# solver to extract a direct link. Every other host is treated as a plain,
-# direct download (fetched straight over HTTP). Keep FuckingFast + DataNodes.
-RESOLVER_HOSTS = ("fuckingfast.co", "datanodes.to")
-
-
-def needs_resolution(link):
-    """True if the link's host needs the Turnstile/CAPTCHA solver."""
-    try:
-        host = urllib.parse.urlparse(link).netloc.lower()
-    except Exception:
-        return False
-    if host.startswith("www."):
-        host = host[4:]
-    return any(host == h or host.endswith("." + h) for h in RESOLVER_HOSTS)
 
 def get_settings_path():
     return os.path.expanduser("~/.silverspoon_settings.json")

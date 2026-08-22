@@ -13,6 +13,7 @@ import shutil
 import uuid
 import urllib.request
 import urllib.error
+import urllib.parse
 from collections import deque
 
 logging.basicConfig(
@@ -435,6 +436,22 @@ from ui_style import button_style
 
 CURRENT_VERSION = "v1.5.0"
 GITHUB_REPO = "billysams21/SilverSpoon"
+
+# Hosts that hide the file behind a Cloudflare/Turnstile challenge and need the
+# solver to extract a direct link. Every other host is treated as a plain,
+# direct download (fetched straight over HTTP). Keep FuckingFast + DataNodes.
+RESOLVER_HOSTS = ("fuckingfast.co", "datanodes.to")
+
+
+def needs_resolution(link):
+    """True if the link's host needs the Turnstile/CAPTCHA solver."""
+    try:
+        host = urllib.parse.urlparse(link).netloc.lower()
+    except Exception:
+        return False
+    if host.startswith("www."):
+        host = host[4:]
+    return any(host == h or host.endswith("." + h) for h in RESOLVER_HOSTS)
 
 def get_settings_path():
     return os.path.expanduser("~/.silverspoon_settings.json")
@@ -1177,7 +1194,7 @@ class MainWindow(QMainWindow):
         left_layout.addLayout(left_header)
 
         self.text_links = QTextEdit()
-        self.text_links.setPlaceholderText("Paste one or multiple FuckingFast URLs here...")
+        self.text_links.setPlaceholderText("Paste FuckingFast / DataNodes links or any direct download URLs here...")
         self.text_links.setAcceptRichText(False)
         self.text_links.setFixedHeight(77)
         self.text_links.installEventFilter(self)
@@ -2801,10 +2818,11 @@ class MainWindow(QMainWindow):
             task.error_message = "Could not get the direct download link. The link may be expired or blocked."
         return None
 
-    def _download_update_file(self, task):
-        """Download an app-update file via urllib (stdlib), with resume,
-        pause/cancel and progress. Kept off the shared curl_cffi session, which
-        hangs (curl 28) for a manager-spawned worker that skips get_direct_link."""
+    def _download_direct_file(self, task):
+        """Download a plain, direct URL via urllib (stdlib), with resume,
+        pause/cancel and progress. Used for app updates and any non-resolver
+        host. Kept off the shared curl_cffi session, which hangs (curl 28) for a
+        manager-spawned worker that skips the get_direct_link/nodriver path."""
         try:
             os.makedirs(task.save_dir, exist_ok=True)
         except Exception as e:
@@ -2817,7 +2835,7 @@ class MainWindow(QMainWindow):
 
         initial_size = os.path.getsize(task.filepath) if os.path.exists(task.filepath) else 0
         req = urllib.request.Request(
-            task.link, headers={"User-Agent": f"SilverSpoon-Updater/{CURRENT_VERSION}"})
+            task.link, headers={"User-Agent": f"SilverSpoon/{CURRENT_VERSION}"})
         if initial_size > 0:
             req.add_header("Range", f"bytes={initial_size}-")
 
@@ -2897,12 +2915,11 @@ class MainWindow(QMainWindow):
         self.trigger_history_save()
 
     def download_worker(self, task):
-        if getattr(task, "is_update", False):
-            # App updates are plain, direct URLs downloaded via urllib (stdlib).
-            # The shared curl_cffi session hangs (curl 28) when a manager-spawned
-            # worker uses it for a request that never went through the
-            # nodriver/get_direct_link path first; urllib is unaffected.
-            self._download_update_file(task)
+        # App updates and any non-resolver (general direct) URL download straight
+        # over HTTP via urllib. Only FuckingFast/DataNodes-style links go through
+        # the Turnstile/CAPTCHA solver + curl transport, exactly as before.
+        if getattr(task, "is_update", False) or not needs_resolution(task.link):
+            self._download_direct_file(task)
             return
 
         dl_url = self.get_direct_link(task)

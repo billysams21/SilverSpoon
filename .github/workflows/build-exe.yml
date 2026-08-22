@@ -64,6 +64,23 @@ jobs:
             if (Test-Path $p) { Remove-Item $p -Force }
           }
 
+      - name: Verify bundle is complete
+        shell: pwsh
+        run: |
+          # Fail loudly instead of shipping a build that crashes on launch.
+          if (-not (Test-Path 'dist\SilverSpoon\SilverSpoon.exe')) {
+            Write-Error 'Bundle incomplete: SilverSpoon.exe missing.'; exit 1
+          }
+          # curl_cffi reads its own package metadata at import; without the
+          # copied .dist-info the app dies with PackageNotFoundError on startup.
+          if (-not (Get-ChildItem 'dist\SilverSpoon\_internal' -Filter 'curl_cffi-*.dist-info' -Directory -ErrorAction SilentlyContinue)) {
+            Write-Error 'Bundle incomplete: curl_cffi metadata (.dist-info) missing -> app would crash on launch.'; exit 1
+          }
+          if (-not (Test-Path 'dist\SilverSpoon\playwright-chromium\chrome.exe')) {
+            Write-Error 'Bundle incomplete: bundled Chromium (chrome.exe) missing.'; exit 1
+          }
+          Write-Host 'Bundle verified: exe + curl_cffi metadata + chromium all present.'
+
       - name: Zip distribution
         shell: pwsh
         run: Compress-Archive -Path 'dist\SilverSpoon' -DestinationPath 'SilverSpoon-windows.zip'

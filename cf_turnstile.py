@@ -21,7 +21,8 @@ def find_browsers():
         if getattr(sys, "frozen", False)
         else os.path.dirname(os.path.abspath(__file__))
     )
-    browser_path = os.path.join(app_dir, "playwright-chromium", "chrome.exe")
+    exe = "chrome.exe" if sys.platform == "win32" else "chrome"
+    browser_path = os.path.join(app_dir, "playwright-chromium", exe)
     found = [browser_path] if os.path.isfile(browser_path) else []
     
     # Local Playwright Chromium is the second choice during development.
@@ -29,11 +30,16 @@ def find_browsers():
     pf = os.environ.get("PROGRAMFILES", "")
     pf86 = os.environ.get("PROGRAMFILES(X86)", "")
     
-    pw_root = os.path.join(la, "ms-playwright")
-    if os.path.isdir(pw_root):
+    pw_roots = [
+        (os.path.join(la, "ms-playwright"), "chrome-win64", "chrome.exe"),
+        (os.path.expanduser("~/.cache/ms-playwright"), "chrome-linux", "chrome"),
+    ]
+    for pw_root, pw_sub, pw_exe in pw_roots:
+        if not os.path.isdir(pw_root):
+            continue
         for entry in sorted(os.listdir(pw_root), reverse=True):
             if entry.startswith("chromium-") and not entry.startswith("chromium_headless"):
-                dev_path = os.path.join(pw_root, entry, "chrome-win64", "chrome.exe")
+                dev_path = os.path.join(pw_root, entry, pw_sub, pw_exe)
                 if os.path.isfile(dev_path):
                     found.append(dev_path)
 
@@ -47,6 +53,11 @@ def find_browsers():
         os.path.join(pf86, "Microsoft", "Edge", "Application", "msedge.exe"),
         os.path.join(la, "Microsoft", "Edge", "Application", "msedge.exe"),
         shutil.which("msedge"),
+        *(shutil.which(name) for name in (
+            "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+            "brave-browser", "microsoft-edge", "microsoft-edge-stable",
+        )),
+        "/snap/bin/chromium",
     ]
     
     for path in system_paths:

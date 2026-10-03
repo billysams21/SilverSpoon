@@ -33,7 +33,7 @@ from PyQt6.QtGui import (
     QKeySequence, QPalette, QPainter, QLinearGradient, QPen, QFont,
     QPainterPath
 )
-from PyQt6.QtCore import Qt, QTimer, QUrl, QEvent, QRectF, QSize, QPointF, QDate, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QUrl, QEvent, QRectF, QSize, QPointF, QDate, pyqtSignal, QLockFile
 from theme_styles import DARK_THEME_QSS, LIGHT_THEME_QSS
 
 class LiveSpeedGraph(QWidget):
@@ -2884,7 +2884,20 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    
+
+    # Single-instance guard: prevent two copies from corrupting shared state
+    _lock_path = os.path.join(tempfile.gettempdir(), "silverspoon.lock")
+    _lock = QLockFile(_lock_path)
+    _lock.setStaleLockTime(30 * 1000)  # treat locks older than 30 s (after a crash) as stale
+    if not _lock.tryLock(0):
+        from PyQt6.QtWidgets import QMessageBox
+        msg = QMessageBox()
+        msg.setWindowTitle("SilverSpoon")
+        msg.setText("SilverSpoon is already running.\nPlease use the existing instance.")
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.exec()
+        sys.exit(1)
+
     # Load settings to apply initial theme
     initial_settings = load_settings()
     apply_theme(app, initial_settings.get("theme", "Dark"))

@@ -28,6 +28,7 @@ A Python-based bulk downloader designed to bypass Cloudflare protections on file
 * **Pause, Resume & Retry:** Safely pause your downloads, recover from network drops, or quickly retry errored links using HTTP `Range` headers.
 * **Graphical Interface:** Includes a clean, modern GUI built with PyQt6.
 * **Command Line Interface:** Also includes a lightweight CLI script for server environments or automation.
+* **Captcha Auto Solver:** Experimental, when enabled it will load [captcha-plugin-turnstile](https://chromewebstore.google.com/detail/captcha-plugin-turnstile/ijmhjekchmipnifjiahkapifokdffffo) extension and solve the extension for you.
 
 ## Requirements
 

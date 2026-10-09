@@ -425,6 +425,7 @@ ProgressBarDelegate = ModernTaskDelegate
 
 from curl_cffi import requests as curl_requests
 from cf_turnstile import TurnstileSolver
+import auto_solver
 from PyQt6.QtCore import QMetaObject, Q_ARG
 from update_logic import UpdateCheckerThread, UpdateDownloaderDialog
 import datetime as _dt
@@ -455,6 +456,7 @@ def load_settings():
         "extract_after_download": False,
         "auto_retry_errors": False,
         "captcha_timeout": 10,
+        "auto_solver": True,
         "column_widths": {},
         "skip_delete_confirmation": False,
         "show_warning_dialog": True,
@@ -642,8 +644,13 @@ class SettingsDialog(QDialog):
         self.captcha_spinbox = QSpinBox()
         self.captcha_spinbox.setRange(5, 120)
         self.captcha_spinbox.setSuffix(" seconds")
-        self.captcha_spinbox.setValue(self.current_settings.get("captcha_timeout", 10))
+        self.captcha_spinbox.setValue(self.current_settings.get("captcha_timeout", 20))
         layout.addRow("CAPTCHA Solve Timeout:", self.captcha_spinbox)
+        
+        # Auto Solver Extension Option
+        self.auto_solver_checkbox = QCheckBox()
+        self.auto_solver_checkbox.setChecked(self.current_settings.get("auto_solver", True))
+        layout.addRow("Auto solve CAPTCHAs:", self.auto_solver_checkbox)
         
         # Extract Option
         self.extract_checkbox = QCheckBox()
@@ -690,6 +697,7 @@ class SettingsDialog(QDialog):
             self.workers_spinbox.setValue(3)
             self.bandwidth_spinbox.setValue(0)
             self.captcha_spinbox.setValue(10)
+            self.auto_solver_checkbox.setChecked(True)
             self.extract_checkbox.setChecked(False)
             self.auto_retry_checkbox.setChecked(False)
             self.skip_delete_checkbox.setChecked(False)
@@ -705,6 +713,7 @@ class SettingsDialog(QDialog):
             "max_workers": self.workers_spinbox.value(),
             "bandwidth_limit": self.bandwidth_spinbox.value(),
             "captcha_timeout": self.captcha_spinbox.value(),
+            "auto_solver": self.auto_solver_checkbox.isChecked(),
             "extract_after_download": self.extract_checkbox.isChecked(),
             "auto_retry_errors": self.auto_retry_checkbox.isChecked(),
             "skip_delete_confirmation": self.skip_delete_checkbox.isChecked(),
@@ -1008,8 +1017,14 @@ class MainWindow(QMainWindow):
         self.tasks = []
         self.max_workers = self.settings.get("max_workers", 3)
         captcha_timeout = self.settings.get("captcha_timeout", 10)
-        self.turnstile_solver = TurnstileSolver(timeout=captcha_timeout)
+        self.turnstile_solver = TurnstileSolver(
+            timeout=captcha_timeout,
+            auto_solver=self.settings.get("auto_solver", True),
+        )
         self.dl_session = curl_requests.Session(impersonate="chrome")
+        if self.settings.get("auto_solver", True):
+            # Fetch the extension in the background so the first CAPTCHA solve
+            threading.Thread(target=self._prefetch_auto_solver, daemon=True).start()
         self.is_all_selected = False
         self.extracted_folders = set()
         
@@ -1058,6 +1073,12 @@ class MainWindow(QMainWindow):
         offpeak.allow_sleep()
         self.turnstile_solver.stop()
         event.accept()
+
+    def _prefetch_auto_solver(self):
+        try:
+            auto_solver.ensure_extension()
+        except Exception as e:
+            logging.error("Auto solver prefetch failed: %s", e)
 
     def setup_ui(self):
         menu_bar = self.menuBar()
@@ -1799,6 +1820,7 @@ class MainWindow(QMainWindow):
             self.max_workers = self.settings.get("max_workers", 3)
             new_timeout = self.settings.get("captcha_timeout", 10)
             self.turnstile_solver.TOKEN_TIMEOUT = new_timeout
+            self.turnstile_solver.set_auto_solver(self.settings.get("auto_solver", True))
             default_dir = self.settings.get("default_save_dir", os.path.join(os.path.expanduser("~"), "Downloads"))
             self.dir_input.setText(default_dir)
             self.extract_checkbox.setChecked(self.settings.get("extract_after_download", False))

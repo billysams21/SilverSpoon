@@ -12,6 +12,8 @@ link.txt
 test_cf*.py
 page.html
 ui_downloader.py
+auto_solver.crx
+/auto_solver/
 
 # Python
 __pycache__/

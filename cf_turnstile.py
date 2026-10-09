@@ -10,6 +10,8 @@ import threading
 import nodriver
 import nodriver.cdp as cdp
 
+import auto_solver
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -59,8 +61,12 @@ def find_browsers():
 class TurnstileSolver:
     MAX_ATTEMPTS = 2
 
-    def __init__(self, profile_dir=None, timeout=10):
+    def __init__(self, profile_dir=None, timeout=10, auto_solver=True, auto_solver_dir=None):
         self.TOKEN_TIMEOUT = timeout
+        # When enabled the "auto solver" extension is downloaded/unpacked and
+        # loaded into the browser via --load-extension.
+        self.auto_solver = bool(auto_solver)
+        self._auto_solver_dir = auto_solver_dir
         self._profile_dir = profile_dir or os.path.join(
             tempfile.gettempdir(), "silverspoon_browser_profile"
         )
@@ -118,6 +124,64 @@ class TurnstileSolver:
             self._browser = None
             self._tab = None
 
+    def _resolve_auto_solver_dir(self):
+        """Download/unpack the extension and return its directory (or None)."""
+        if self._auto_solver_dir and os.path.isdir(self._auto_solver_dir):
+            return self._auto_solver_dir
+        try:
+            return auto_solver.ensure_extension()
+        except Exception as e:
+            logger.error("TurnstileSolver: could not prepare auto solver extension: %s", e)
+            return None
+
+    async def _load_extension_cdp(self, ext_dir):
+        """Load an unpacked extension via the browser-level CDP command.
+
+        This is the supported replacement for ``--load-extension`` on branded
+        Chrome 137+. It is idempotent, so it is safe to call even when the
+        legacy command-line flag already loaded the extension.
+        """
+
+        last_err = None
+        for attempt in range(3):
+            try:
+                ext_id = await self._browser.send(
+                    cdp.extensions.load_unpacked(path=ext_dir)
+                )
+                logger.info(
+                    "TurnstileSolver: extension loaded via CDP (id=%s, attempt=%s)",
+                    ext_id,
+                    attempt + 1,
+                )
+                return True
+            except Exception as e:
+                last_err = e
+                logger.warning(
+                    "TurnstileSolver: CDP Extensions.loadUnpacked attempt %s failed (%s)",
+                    attempt + 1,
+                    e,
+                )
+                await asyncio.sleep(0.5)
+
+        logger.warning(
+            "TurnstileSolver: CDP Extensions.loadUnpacked failed after retries (%s); "
+            "relying on --load-extension",
+            last_err,
+        )
+        return False
+
+    def set_auto_solver(self, enabled):
+        """Toggle the extension. Restarts the browser so it takes effect."""
+        enabled = bool(enabled)
+        if enabled == self.auto_solver:
+            return
+        self.auto_solver = enabled
+        if self._browser is not None and self._loop is not None:
+            try:
+                self._submit(self._close_browser())
+            except Exception:
+                pass
+
     async def _ensure_browser(self):
         if self._browser is not None:
             return
@@ -128,6 +192,43 @@ class TurnstileSolver:
                 "SilverSpoon and keep the playwright-chromium folder beside the executable."
             )
         os.makedirs(self._profile_dir, exist_ok=True)
+        browser_args = [
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-restore-session-state",
+            "--window-size=500,550",
+            "--window-position=50,50",
+            # Chrome 137+ requires this flag before DevTools will start a
+            # debugging session ("Inspect views: service worker") for unpacked
+            # extensions. Apply unconditionally so extensions the user loads
+            # manually can be debugged even when auto_solver is off.
+            "--enable-unsafe-extension-debugging",
+            # Chrome 155 enforces enterprise policy restrictions on
+            # chrome.debugger.attach() ("Host access is restricted by policy." /
+            # "Screenshot capture is restricted by policy.") on managed
+            # browsers. This machine is policy-managed, so we must disable that
+            # feature or the extension cannot start its debugging session. This
+            # flag is removed in Chrome 160.
+            "--disable-features=ExtensionDebuggerStrictPolicyRestrictions",
+        ]
+        ext_dir = None
+        if self.auto_solver:
+            ext_dir = await asyncio.to_thread(self._resolve_auto_solver_dir)
+            if ext_dir:
+                logger.info("TurnstileSolver: preparing auto solver extension from %s", ext_dir)
+                browser_args += [
+                    # Legacy fallback for unbranded Chromium where CDP loading
+                    # over the websocket port may not be available. Ignored by
+                    # branded Chrome. NOTE: do NOT add
+                    # --disable-extensions-except here - it makes Chrome refuse
+                    # to register the CDP-loaded extension.
+                    f"--load-extension={ext_dir}",
+                    # Chrome 137+ ignores --load-extension on branded builds
+                    # unless this feature is disabled.
+                    "--disable-features=DisableLoadExtensionCommandLineSwitch",
+                ]
+            else:
+                logger.warning("TurnstileSolver: auto solver enabled but extension unavailable")
         last_err = None
         for bp in candidates:
             try:
@@ -137,15 +238,11 @@ class TurnstileSolver:
                     browser_executable_path=bp,
                     user_data_dir=self._profile_dir,
                     sandbox=False,
-                    browser_args=[
-                        "--no-first-run",
-                        "--no-default-browser-check",
-                        "--disable-restore-session-state",
-                        "--window-size=500,550",
-                        "--window-position=50,50",
-                    ],
+                    browser_args=browser_args,
                 )
                 self._tab = await self._browser.get("about:blank")
+                if ext_dir:
+                    await self._load_extension_cdp(ext_dir)
                 await self._tab.send(cdp.page.add_script_to_evaluate_on_new_document(
                     """(() => {
                         Object.defineProperty(window, 'open', {

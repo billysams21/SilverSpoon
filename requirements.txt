@@ -2,3 +2,5 @@ curl_cffi>=0.7,<1.0
 # pre-1.0, minor bumps can break the CAPTCHA solver
 nodriver>=0.50,<0.51
 PyQt6>=6.11.0
+# Unpacks "auto solve captcha" browser extension (*.crx)
+crx-unpack>=0.1.4

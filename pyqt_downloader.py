@@ -282,7 +282,7 @@ class ModernTaskDelegate(QStyledItemDelegate):
                 is_error = "Error" in status_text or status_text == "Contains Errors" or status_text == "CAPTCHA Timeout"
                 is_done = status_text in ("Completed", "Extracted")
                 is_active = status_text in ("Downloading", "Active", "Extracting...", "Solving CAPTCHA...", "Starting...")
-                is_paused = status_text in ("Paused", "Pausing...", "Cancelled")
+                is_paused = status_text in ("Paused", "Pausing...", "Cancelled", "Extract Cancelled")
 
                 # Detect if the app is currently running in dark or light mode based on window palette
                 window_bg = option.palette.color(QPalette.ColorRole.Window)
@@ -390,10 +390,13 @@ class ModernTaskDelegate(QStyledItemDelegate):
                     fill_rect = QRectF(rect.x() + 4, bar_y, fill_w, bar_h)
                     
                     is_error = "Error" in status or status == "Contains Errors"
-                    is_done = status in ("Completed", "Extracted")
+                    is_done = status in ("Completed", "Extracted", "Extract Cancelled")
                     
-                    # Progress bar stays standard neutral/blue fill, or emerald on complete
-                    if is_done:
+                    # Progress bar stays standard neutral/blue fill, or emerald on complete;
+                    # violet while extracting so it reads differently from a download.
+                    if status == "Extracting...":
+                        g_start, g_end = (QColor("#a78bfa"), QColor("#6d28d9")) if is_dark else (QColor("#7c3aed"), QColor("#5b21b6"))
+                    elif is_done:
                         g_start, g_end = (QColor("#22c55e"), QColor("#15803d")) if is_dark else (QColor("#16a34a"), QColor("#15803d"))
                     elif is_error:
                         # Muted slate/amber fill on error so it doesn't scream red alongside the red error tag
@@ -410,7 +413,11 @@ class ModernTaskDelegate(QStyledItemDelegate):
                     painter.drawRoundedRect(fill_rect, 2, 2)
 
                 # Progress text
-                prog_str = f"{progress:.1f}%" if status not in ("Extracted", "Extracting...", "Extract Error") else "--"
+                if status == "Extracting...":
+                    # 0 until the extractor reports (WinRAR never does).
+                    prog_str = f"{progress:.1f}%" if progress > 0 else "Extracting..."
+                else:
+                    prog_str = f"{progress:.1f}%" if status not in ("Extracted", "Extract Error") else "--"
                 font = painter.font()
                 font.setPointSize(8)
                 font.setBold(True)
@@ -440,6 +447,7 @@ import datetime as _dt
 import scheduler as offpeak
 from ui_style import button_style
 from providers import needs_resolution, filename_from_link, RESOLVER_HOSTS
+from extraction import list_archive, is_extracted, run_with_progress, ExtractionCancelled
 
 CURRENT_VERSION = "v1.5.5"
 GITHUB_REPO = "billysams21/SilverSpoon"
@@ -938,6 +946,10 @@ class DownloadTask:
         # and, once complete, offer to install instead of being extracted.
         self.is_update = False
         self.update_version = None
+
+        # Extraction progress (0-100) while status is "Extracting...", or None
+        # when the extractor doesn't report one. Not persisted.
+        self.extract_progress = None
 
     def to_dict(self):
         return {
@@ -1560,7 +1572,7 @@ class MainWindow(QMainWindow):
         for i in range(self.tree.topLevelItemCount()):
             batch_item = self.tree.topLevelItem(i)
             folder_tasks = [t for t in self.tasks if t.folder_name == batch_item.text(0)]
-            if folder_tasks and all(t.status in ("Completed", "Extracted") for t in folder_tasks):
+            if folder_tasks and all(t.status in ("Completed", "Extracted", "Extract Cancelled") for t in folder_tasks):
                 batch_item.setExpanded(False)
             else:
                 batch_item.setExpanded(True)
@@ -2031,7 +2043,7 @@ class MainWindow(QMainWindow):
         for task in scheduled:
             key = self._task_key(task)
             session.snapshot[key] = task.downloaded_bytes
-            if task.status in ("Completed", "Extracted"):
+            if task.status in ("Completed", "Extracted", "Extract Cancelled"):
                 session.completed_before.add(key)
         self.offpeak_session = session
         self.offpeak_session_uids = {t.uid for t in scheduled}
@@ -2066,7 +2078,7 @@ class MainWindow(QMainWindow):
         scheduled = [t for t in self.tasks if uids is None or t.uid in uids]
         bytes_now = {self._task_key(t): t.downloaded_bytes for t in scheduled}
         completed_now = {self._task_key(t) for t in scheduled
-                         if t.status in ("Completed", "Extracted")}
+                         if t.status in ("Completed", "Extracted", "Extract Cancelled")}
         summary = offpeak.summarize(session, now, bytes_now, completed_now)
         report_path = offpeak.get_report_path()
         report_saved = offpeak.append_report(summary, report_path)
@@ -2266,7 +2278,11 @@ class MainWindow(QMainWindow):
 
     def cancel_selected(self):
         for task in self.get_selected_tasks():
-            if task.status in ("Downloading", "Pending", "Paused", "Starting...", "Queued"):
+            if task.status == "Extracting...":
+                # extract_folder notices within ~0.2 s, kills the extractor
+                # and sets "Extract Cancelled" (the download itself is kept).
+                task.cancel_flag = True
+            elif task.status in ("Downloading", "Pending", "Paused", "Starting...", "Queued"):
                 task.cancel_flag = True
                 task.pause_flag = False
                 task.status = "Cancelled"
@@ -2405,7 +2421,7 @@ class MainWindow(QMainWindow):
         self.trigger_history_save()
                 
     def clear_finished(self):
-        to_remove = [t for t in self.tasks if t.status in ("Completed", "Extracted", "Cancelled")]
+        to_remove = [t for t in self.tasks if t.status in ("Completed", "Extracted", "Cancelled", "Extract Cancelled")]
         
         if not to_remove:
             return
@@ -2443,7 +2459,11 @@ class MainWindow(QMainWindow):
         for task in self.tasks:
             if not task.tree_item:
                 continue
-            prog_str = f"{task.progress:.1f}%" if task.status not in ("Extracted", "Extracting...", "Extract Error") else "-"
+            extracting = task.status == "Extracting..."
+            if extracting:
+                prog_str = f"{task.extract_progress:.1f}%" if task.extract_progress is not None else "-"
+            else:
+                prog_str = f"{task.progress:.1f}%" if task.status not in ("Extracted", "Extract Error") else "-"
             speed_str = f"{task.speed:.2f} MB/s" if task.status == "Downloading" else "-"
             size_mb = task.total_bytes / (1024*1024)
             dl_mb = task.downloaded_bytes / (1024*1024)
@@ -2474,13 +2494,15 @@ class MainWindow(QMainWindow):
                 global_speed += task.speed
                 
             # Store the progress and status in the item's data for the custom delegate to paint
-            task.tree_item.setData(0, Qt.ItemDataRole.UserRole, task.progress)
+            # (while extracting, the bar shows extraction progress instead).
+            bar_value = (task.extract_progress or 0.0) if extracting else task.progress
+            task.tree_item.setData(0, Qt.ItemDataRole.UserRole, bar_value)
             task.tree_item.setData(1, Qt.ItemDataRole.UserRole, task.status)
                 
         # Update telemetry stat counters
         active_count = sum(1 for t in self.tasks if t.status in ("Downloading", "Starting...", "Solving CAPTCHA...", "Extracting..."))
         queued_count = sum(1 for t in self.tasks if t.status in ("Queued", "Pending"))
-        done_count = sum(1 for t in self.tasks if t.status in ("Completed", "Extracted"))
+        done_count = sum(1 for t in self.tasks if t.status in ("Completed", "Extracted", "Extract Cancelled"))
         self.stat_active_val.setText(str(active_count))
         self.stat_queued_val.setText(str(queued_count))
         self.stat_done_val.setText(str(done_count))
@@ -2501,7 +2523,8 @@ class MainWindow(QMainWindow):
             all_completed = True
             any_error = False
             any_downloading = False
-            
+            extracting_progress = []
+
             child_count = batch_item.childCount()
             if child_count == 0:
                 continue
@@ -2526,8 +2549,10 @@ class MainWindow(QMainWindow):
                             
                     total_speed += getattr(task, 'speed', 0.0)
                     
-                    if task.status not in ("Completed", "Extracted"):
+                    if task.status not in ("Completed", "Extracted", "Extracting...", "Extract Cancelled"):
                         all_completed = False
+                    if task.status == "Extracting...":
+                        extracting_progress.append(task.extract_progress)
                     if "Error" in task.status:
                         any_error = True
                     if task.status in ("Downloading", "Starting...", "Pending"):
@@ -2536,10 +2561,7 @@ class MainWindow(QMainWindow):
             # Determine batch status
             batch_status = "Queued"
             if all_completed:
-                if any(t.status == "Extracting..." for t in [next((t for t in self.tasks if t.tree_item == batch_item.child(k)), None) for k in range(batch_item.childCount()) if next((t for t in self.tasks if t.tree_item == batch_item.child(k)), None)]):
-                    batch_status = "Extracting..."
-                else:
-                    batch_status = "Completed"
+                batch_status = "Extracting..." if extracting_progress else "Completed"
             elif any_error:
                 batch_status = "Contains Errors"
             elif any_downloading:
@@ -2547,6 +2569,11 @@ class MainWindow(QMainWindow):
                 
             prog = (total_dl / total_size * 100) if total_size > 0 else 0
             prog_str = f"{prog:.1f}%"
+            if batch_status == "Extracting...":
+                # The whole folder extracts together, so its tasks share one value.
+                known = [p for p in extracting_progress if p is not None]
+                prog = sum(known) / len(known) if known else 0.0
+                prog_str = f"{prog:.1f}%" if known else "-"
             speed_str = f"{total_speed:.2f} MB/s" if total_speed > 0 else "-"
             size_mb = total_size / (1024*1024)
             dl_mb = total_dl / (1024*1024)
@@ -2626,17 +2653,35 @@ class MainWindow(QMainWindow):
                 folders[task.folder_name] = []
             folders[task.folder_name].append(task)
             
+        to_extract = {}
         for folder_name, tasks_in_folder in folders.items():
             if any(t.status == "Extracting..." for t in tasks_in_folder):
                 continue
-                
-            all_folder_tasks = [t for t in self.tasks if t.folder_name == folder_name]
-            
+            to_extract[folder_name] = [t for t in self.tasks if t.folder_name == folder_name]
+
+        # Re-extracting overwrites what's on disk, so confirm it first.
+        already = [name for name, folder_tasks in to_extract.items() if self._already_extracted(folder_tasks)]
+        if already:
+            shown = "\n".join(f"  • {name}" for name in already[:10])
+            if len(already) > 10:
+                shown += f"\n  … and {len(already) - 10} more"
+            reply = QMessageBox.question(
+                self, "Already Extracted",
+                f"These are already extracted:\n\n{shown}\n\n"
+                "Extract them again? Existing files will be overwritten.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                for name in already:
+                    to_extract.pop(name)
+
+        for folder_name, all_folder_tasks in to_extract.items():
             # Remove from extracted set so it can be extracted again if needed
             self.extracted_folders.discard(folder_name)
             self.extracted_folders.add(folder_name)
-            
-            threading.Thread(target=self.extract_folder, args=(all_folder_tasks,), daemon=True).start()
+
+            # An explicit "Extract Now" always extracts, even over existing files.
+            threading.Thread(target=self.extract_folder, args=(all_folder_tasks, True), daemon=True).start()
 
     def check_extraction(self):
         # Group tasks by folder
@@ -2667,33 +2712,101 @@ class MainWindow(QMainWindow):
                 self.extracted_folders.add(folder_name)
                 threading.Thread(target=self.extract_folder, args=(tasks_in_folder,), daemon=True).start()
 
-    def extract_folder(self, tasks_in_folder):
+    @staticmethod
+    def _archive_volumes(save_dir):
+        """First volume of each archive in save_dir, i.e. what the extractor is given."""
+        files = sorted(os.listdir(save_dir))
+        vols = []
+        for f in files:
+            # 1. Main multipart start (.part01.rar, .part1.rar)
+            if re.search(r'\.part0*1\.rar$', f, re.IGNORECASE):
+                vols.append(os.path.join(save_dir, f))
+            # 2. Sequential start (.001)
+            elif re.search(r'\.001$', f):
+                vols.append(os.path.join(save_dir, f))
+            # 3. Standalone .rar or .zip (not part of a sequence)
+            elif f.lower().endswith(('.rar', '.zip')) and not re.search(r'\.part\d+\.rar$', f, re.IGNORECASE):
+                vols.append(os.path.join(save_dir, f))
+        if not vols and files:
+            # Fallback to just the first file alphabetically
+            vols.append(os.path.join(save_dir, files[0]))
+        return vols
+
+    @staticmethod
+    def _find_extractor():
+        """(extractor_type, command, seven_zip) for this platform; extractor_type
+        is None if nothing is installed. seven_zip reads archive listings, also
+        when WinRAR does the extracting, and is None if no 7-Zip is available."""
+        extractor_type = None
+        base_cmd = None
+        bundled_7z = None
+        if sys.platform == 'win32':
+            # Windows: prefer installed 7-Zip > WinRAR > bundled 7z.exe
+            if hasattr(sys, '_MEIPASS'):
+                bundled_7z = os.path.join(sys._MEIPASS, '7z.exe')
+            else:
+                bundled_7z = os.path.join(os.path.dirname(os.path.abspath(__file__)), '7z.exe')
+            installed_7z = r"C:\Program Files\7-Zip\7z.exe"
+            installed_winrar = r"C:\Program Files\WinRAR\WinRAR.exe"
+            if os.path.exists(installed_7z):
+                extractor_type = '7z'
+                base_cmd = installed_7z
+            elif os.path.exists(installed_winrar):
+                extractor_type = 'winrar'
+                base_cmd = installed_winrar
+            elif os.path.exists(bundled_7z):
+                extractor_type = '7z'
+                base_cmd = bundled_7z
+        else:
+            if shutil.which('7z'):
+                extractor_type = '7z'
+                base_cmd = '7z'
+            elif shutil.which('unrar'):
+                extractor_type = 'unrar'
+                base_cmd = 'unrar'
+
+        if extractor_type == '7z':
+            seven_zip = base_cmd
+        elif bundled_7z and os.path.exists(bundled_7z):
+            seven_zip = bundled_7z
+        else:
+            seven_zip = shutil.which('7z')
+        return extractor_type, base_cmd, seven_zip
+
+    def _already_extracted(self, tasks_in_folder):
+        """True if the folder is marked Extracted, or every file in its
+        archives is already on disk with the right size."""
+        if all(t.status == "Extracted" for t in tasks_in_folder):
+            return True
+        save_dir = tasks_in_folder[0].save_dir
+        try:
+            vols = self._archive_volumes(save_dir)
+        except OSError:
+            return False
+        seven_zip = self._find_extractor()[2]
+        if not vols or not seven_zip:
+            return False
+        for vol in vols:
+            entries = list_archive(seven_zip, vol)
+            if not (entries and is_extracted(entries, save_dir)):
+                return False
+        return True
+
+    def extract_folder(self, tasks_in_folder, force=False):
         save_dir = tasks_in_folder[0].save_dir
         folder_name = tasks_in_folder[0].folder_name
-        
+
         for t in tasks_in_folder:
             t.status = "Extracting..."
-            
+            t.extract_progress = None
+            t.cancel_flag = False
+
+        # Cancel (or Delete) on any task of the folder stops its extraction.
+        def should_stop():
+            return any(t.cancel_flag for t in tasks_in_folder)
+
         try:
-            files = os.listdir(save_dir)
-            files.sort()
-            
-            vols_to_extract = []
-            for f in files:
-                # 1. Main multipart start (.part01.rar, .part1.rar)
-                if re.search(r'\.part0*1\.rar$', f, re.IGNORECASE):
-                    vols_to_extract.append(os.path.join(save_dir, f))
-                # 2. Sequential start (.001)
-                elif re.search(r'\.001$', f):
-                    vols_to_extract.append(os.path.join(save_dir, f))
-                # 3. Standalone .rar or .zip (not part of a sequence)
-                elif f.lower().endswith(('.rar', '.zip')) and not re.search(r'\.part\d+\.rar$', f, re.IGNORECASE):
-                    vols_to_extract.append(os.path.join(save_dir, f))
-                    
-            if not vols_to_extract and files:
-                # Fallback to just the first file alphabetically
-                vols_to_extract.append(os.path.join(save_dir, files[0]))
-                
+            vols_to_extract = self._archive_volumes(save_dir)
             if not vols_to_extract:
                 for t in tasks_in_folder:
                     t.status = "Extract Error (No File)"
@@ -2701,35 +2814,8 @@ class MainWindow(QMainWindow):
                 if folder_name in self.extracted_folders:
                     self.extracted_folders.remove(folder_name)
                 return
-                
-            # Locate an available extractor (platform-aware)
-            extractor_type = None
-            base_cmd = None
-            if sys.platform == 'win32':
-                # Windows: prefer installed 7-Zip > WinRAR > bundled 7z.exe
-                if hasattr(sys, '_MEIPASS'):
-                    bundled_7z = os.path.join(sys._MEIPASS, '7z.exe')
-                else:
-                    bundled_7z = os.path.join(os.path.dirname(os.path.abspath(__file__)), '7z.exe')
-                installed_7z = r"C:\Program Files\7-Zip\7z.exe"
-                installed_winrar = r"C:\Program Files\WinRAR\WinRAR.exe"
-                if os.path.exists(installed_7z):
-                    extractor_type = '7z'
-                    base_cmd = installed_7z
-                elif os.path.exists(installed_winrar):
-                    extractor_type = 'winrar'
-                    base_cmd = installed_winrar
-                elif os.path.exists(bundled_7z):
-                    extractor_type = '7z'
-                    base_cmd = bundled_7z
-            else:
-                if shutil.which('7z'):
-                    extractor_type = '7z'
-                    base_cmd = '7z'
-                elif shutil.which('unrar'):
-                    extractor_type = 'unrar'
-                    base_cmd = 'unrar'
-                
+
+            extractor_type, base_cmd, seven_zip = self._find_extractor()
             if not extractor_type:
                 for t in tasks_in_folder:
                     t.status = "Extract Error (No extractor found)"
@@ -2737,33 +2823,67 @@ class MainWindow(QMainWindow):
                 if folder_name in self.extracted_folders:
                     self.extracted_folders.remove(folder_name)
                 return
-                
+
+            listings = [list_archive(seven_zip, vol) if seven_zip else None for vol in vols_to_extract]
+
+            # Auto-extract skips archives whose files are already all on disk
+            # with matching sizes (e.g. extracted earlier, outside the app or
+            # before the history was reset).
+            if not force and all(entries and is_extracted(entries, save_dir) for entries in listings):
+                for t in tasks_in_folder:
+                    t.status = "Extracted"
+                    t.error_message = ""
+                    t.extract_progress = None
+                self.trigger_history_save()
+                return
+
+            # Weight each archive by its unpacked size so the bar moves evenly
+            # across a folder with several archives.
+            weights = [sum(size for _, size in entries) if entries else 0 for entries in listings]
+            if not all(weights):
+                weights = [1] * len(vols_to_extract)
+            total_weight = sum(weights)
+            done_weight = 0
+
             # Extract each base volume found
-            creationflags = 0x08000000 if sys.platform == 'win32' else 0
-            for vol in vols_to_extract:
+            for vol, weight in zip(vols_to_extract, weights):
+                if should_stop():
+                    raise ExtractionCancelled()
                 if extractor_type == '7z':
-                    cmd = [base_cmd, 'x', vol, f'-o{save_dir}', '-y']
+                    cmd = [base_cmd, 'x', vol, f'-o{save_dir}', '-y', '-bsp1', '-bso0']
                 elif extractor_type == 'winrar':
                     cmd = [base_cmd, 'x', '-y', vol, f'{save_dir}\\']
                 elif extractor_type == 'unrar':
                     cmd = [base_cmd, 'x', vol, f'{save_dir}/', '-y']
-                    
-                subprocess.run(
-                    cmd,
-                    check=True,
-                    creationflags=creationflags,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL
-                )
-            
+
+                def report(percent, base=done_weight, weight=weight):
+                    value = (base + weight * percent / 100) / total_weight * 100
+                    for t in tasks_in_folder:
+                        t.extract_progress = value
+
+                returncode, output = run_with_progress(cmd, report, should_stop)
+                if returncode != 0:
+                    raise subprocess.CalledProcessError(returncode, cmd, output=output)
+                done_weight += weight
+
             for t in tasks_in_folder:
                 t.status = "Extracted"
                 t.error_message = ""
+                t.extract_progress = None
             self.trigger_history_save()
-                
+
+        except ExtractionCancelled:
+            # Partly extracted files stay on disk; "Extract Now" redoes it. The
+            # folder stays in extracted_folders and the status isn't one
+            # check_extraction picks up, so auto-extract won't restart it.
+            for t in tasks_in_folder:
+                if t.status == "Extracting...":  # a deleted task is already "Cancelled"
+                    t.status = "Extract Cancelled"
+                t.extract_progress = None
+                t.cancel_flag = False
+            self.trigger_history_save()
         except subprocess.CalledProcessError as e:
-            logging.error(f"Extraction error (subprocess): {e}", exc_info=True)
+            logging.error(f"Extraction error (subprocess): {e}\n{(e.output or '')[-500:]}", exc_info=True)
             for t in tasks_in_folder:
                 t.status = "Extract Error (Corrupt?)"
                 t.error_message = f"Extractor failed with exit code {e.returncode}. The archive may be corrupt, incomplete, or password-protected."

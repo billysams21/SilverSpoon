@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v1.5.5] - 2026-09-08
+
+### New Features
+* **General Direct-URL Downloads**: Any link whose host isn't a Cloudflare/Turnstile provider (FuckingFast, DataNodes) now downloads straight over HTTP with resume/pause/progress — the queue is no longer limited to those providers. FuckingFast and DataNodes links still go through the Turnstile solver exactly as before.
+
+### Fixes & Improvements
+* **Updates download in the queue (no more crash):** The auto-updater no longer uses a separate modal downloader (which could crash mid-download on large releases). A new version is now added to your normal download queue — start it when you like, and pause/resume it like any other download; it saves to your Save-To folder. When it finishes, choose **Install now** (restart) or **Install on next open**; a deferred update is offered again the next time you launch. Update downloads skip the Cloudflare/CAPTCHA step and are never auto-extracted.
+* **Solver No Longer Spawns Endless Browsers**: A failed link resolution now tears the browser down instead of leaving a broken one to be reused, so Chromium no longer keeps re-spawning without ever reaching the download page; CAPTCHA timeouts are no longer auto-retried.
+* **Status Pill Overflow**: The STATUS tag no longer overflows into the PROGRESS column for long statuses (e.g. "Solving CAPTCHA...") — it's clamped to its column and elided.
+* **Release CI**: Fixed the Windows build workflow so it actually produces and attaches the release `.zip` (added `contents: write` permission; resolve bundled Chromium via Playwright's own path instead of a fragile glob; verify the bundle before zipping).
+
 ## [v1.5.1] - 2026-08-22
 
 ### New Features

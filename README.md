@@ -1,14 +1,15 @@
 # SilverSpoon (previously FitGirlDownloader)
 
-> **Note:** Currently supports `fuckingfast.co` and `datanodes.to` links (commonly used by FitGirl Repacks and direct download mirrors). Support for additional hosts may be added in the future.
+> **Note:** `fuckingfast.co` and `datanodes.to` links (commonly used by FitGirl Repacks and direct download mirrors) go through the built-in Cloudflare Turnstile solver. Since v1.5.5 any other plain `http(s)` direct link is downloaded straight away, with the same pause/resume/progress support.
 
-A Python-based bulk downloader designed to bypass Cloudflare protections on file-hosting sites like *fuckingfast.co* and *datanodes.to*. It automates the process of extracting direct download links and supports concurrent downloading with pause and resume capabilities.
+A Python-based bulk downloader designed to bypass Cloudflare protections on file-hosting sites like *fuckingfast.co* and *datanodes.to*, and to queue ordinary direct download links alongside them. It automates the process of extracting direct download links and supports concurrent downloading with pause and resume capabilities.
 
 ## Features
 
-* **Auto-Updater:** (Windows only) Automatically checks for, downloads, and applies new updates so you are always on the latest version without manual `.zip` downloads.
+* **Auto-Updater:** (Windows only) Checks for new releases on launch (or via `Help -> Check for Updates...`). An update is added to your normal download queue — start, pause and resume it like any other task; it saves to your Save-To folder and skips the CAPTCHA step. When it finishes, choose **Install now** (restart) or **Install on next open**.
+* **General Direct-URL Downloads:** Any link whose host isn't a Turnstile-protected provider is downloaded directly over HTTP with resume, pause and progress — the queue is not limited to FuckingFast/DataNodes.
 * **Cross-Platform Extraction:** Built-in auto-extraction support for Windows (bundled `7z`), as well as Linux and macOS (via `/usr/bin/7z` / `p7zip`).
-* **Cloudflare Turnstile Bypass:** Uses a hidden Chromium browser (via `nodriver`) to auto-solve Cloudflare Turnstile challenges invisibly, then downloads via `curl_cffi` with TLS impersonation. No manual CAPTCHA solving needed for normal IPs.
+* **Cloudflare Turnstile Bypass:** Uses a hidden Chromium browser (via `nodriver`) to auto-solve Cloudflare Turnstile challenges invisibly, then downloads via `curl_cffi` with TLS impersonation. No manual CAPTCHA solving needed for normal IPs. A failed resolution tears the browser down instead of reusing a broken one, so Chromium no longer re-spawns endlessly.
 * **Persistent Download History:** Automatically saves your task queue, progress, and folder groupings across sessions. Close the app anytime without losing your place!
 * **Grouped Batch Folders:** Downloads are neatly organized into collapsible dropdown trees, showing aggregated progress, speed, and ETA for entire batches.
 * **Smart Folder Grouping & Batching:** Automatically suggests a unified folder name for a batch of links, perfectly grouping main game parts and messy optional files together.
@@ -57,7 +58,7 @@ python pyqt_downloader.py
 ![App Screenshot 1](assets/screenshot1.png)
 
 1. Click **Browse...** to select your base save directory (or set a persistent default in `File -> Settings`).
-2. Open the game link and click the provider you want to use (for now it's FuckingFast).
+2. Open the game link and click the provider you want to use (FuckingFast or DataNodes). Plain direct links from any other host can be pasted as-is.
 ![FitGirl 1](assets/fitgirl1.png)
 3. Copy the links you want to download.
 ![FitGirl 2](assets/fitgirl2.png)
@@ -91,6 +92,10 @@ If you prefer the command line:
    python downloader.py link.txt
    ```
 *(Files will be downloaded to the current working directory).*
+
+## Building the Windows executable
+
+Run `build_exe.bat` (needs `pyinstaller` and a Playwright Chromium under `%LOCALAPPDATA%\ms-playwright`); the distributable folder lands in `dist\SilverSpoon`. Pushing a `v*.*.*` tag runs the same build on GitHub Actions and attaches `SilverSpoon-windows.zip` to the release.
 
 ## Contributing
 

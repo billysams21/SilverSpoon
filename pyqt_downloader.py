@@ -446,7 +446,10 @@ from update_logic import UpdateCheckerThread
 import datetime as _dt
 import scheduler as offpeak
 from ui_style import button_style
-from providers import needs_resolution, filename_from_link, RESOLVER_HOSTS
+from providers import (
+    needs_resolution, needs_form_resolution, resolve_form_link, ResolveError,
+    filename_from_link, RESOLVER_HOSTS,
+)
 from extraction import list_archive, is_extracted, run_with_progress, ExtractionCancelled
 
 CURRENT_VERSION = "v1.6.0"
@@ -1194,7 +1197,7 @@ class MainWindow(QMainWindow):
         left_layout.addLayout(left_header)
 
         self.text_links = QTextEdit()
-        self.text_links.setPlaceholderText("Paste FuckingFast / DataNodes links or any direct download URLs here...")
+        self.text_links.setPlaceholderText("Paste FuckingFast / DataNodes / FileKeeper links or any direct download URLs here...")
         self.text_links.setAcceptRichText(False)
         self.text_links.setFixedHeight(77)
         self.text_links.installEventFilter(self)
@@ -1621,6 +1624,7 @@ class MainWindow(QMainWindow):
             "<hr>"
             "<h4>Changelog (v1.6.0 - Short):</h4>"
             "<ul>"
+            "<li><b>New:</b> FileKeeper (<code>filekeeper.net</code>) links are supported.</li>"
             "<li><b>New:</b> Extraction progress bar, cancellable extraction, and a confirmation before re-extracting.</li>"
             "<li><b>New:</b> Auto-extract skips archives that are already extracted.</li>"
             "<li><b>New:</b> Any direct download link can be queued, not just FuckingFast/DataNodes.</li>"
@@ -2925,24 +2929,25 @@ class MainWindow(QMainWindow):
             task.error_message = "Could not get the direct download link. The link may be expired or blocked."
         return None
 
-    def _download_direct_file(self, task):
+    def _download_direct_file(self, task, url=None):
         """Download a plain, direct URL via urllib (stdlib), with resume,
-        pause/cancel and progress. Used for app updates and any non-resolver
-        host. Kept off the shared curl_cffi session, which hangs (curl 28) for a
-        manager-spawned worker that skips the get_direct_link/nodriver path."""
+        pause/cancel and progress. Used for app updates, form hosts (url is
+        then the resolved link) and any non-resolver host. Kept off the shared
+        curl_cffi session, which hangs (curl 28) for a manager-spawned worker
+        that skips the get_direct_link/nodriver path."""
         try:
             os.makedirs(task.save_dir, exist_ok=True)
         except Exception as e:
             task.status = "Error"
             task.error_message = (
-                f"Failed to create update folder '{task.save_dir}'. "
+                f"Failed to create download folder '{task.save_dir}'. "
                 f"{format_error_message(e)}")
             self.trigger_history_save()
             return
 
         initial_size = os.path.getsize(task.filepath) if os.path.exists(task.filepath) else 0
         req = urllib.request.Request(
-            task.link, headers={"User-Agent": f"SilverSpoon/{CURRENT_VERSION}"})
+            url or task.link, headers={"User-Agent": f"SilverSpoon/{CURRENT_VERSION}"})
         if initial_size > 0:
             req.add_header("Range", f"bytes={initial_size}-")
 
@@ -3009,7 +3014,7 @@ class MainWindow(QMainWindow):
             self._update_download_failed(task, e)
 
     def _update_download_failed(self, task, exc):
-        logging.error("Update download error for %s: %s", task.link, exc, exc_info=True)
+        logging.error("Direct download error for %s: %s", task.link, exc, exc_info=True)
         if task.cancel_flag or task.pause_flag:
             return
         if self.settings.get("auto_retry_errors", False) and task.retry_count < 3:
@@ -3018,15 +3023,51 @@ class MainWindow(QMainWindow):
             task.error_message = ""
         else:
             task.status = "Error"
-            task.error_message = f"Update download failed. {format_error_message(exc)}"
+            what = "Update download" if getattr(task, "is_update", False) else "Download"
+            task.error_message = f"{what} failed. {format_error_message(exc)}"
         self.trigger_history_save()
+
+    def _resolve_form_link(self, task):
+        """Direct URL for a form host (FileKeeper) link, or None if it failed
+        or the task was paused/cancelled during the countdown. Resolved afresh
+        on every start/resume, so an expired signed link never sticks."""
+        def wait(seconds):
+            end = time.time() + seconds
+            while time.time() < end and not (task.cancel_flag or task.pause_flag):
+                time.sleep(0.25)
+
+        try:
+            url = resolve_form_link(task.link, sleep=wait)
+        except Exception as e:
+            logging.error("Form host resolution error for %s: %s", task.link, e, exc_info=True)
+            if task.cancel_flag or task.pause_flag:
+                return None
+            if self.settings.get("auto_retry_errors", False) and task.retry_count < 3:
+                task.retry_count += 1
+                task.status = "Pending"
+                task.error_message = ""
+            else:
+                task.status = "Error"
+                detail = str(e) if isinstance(e, ResolveError) else format_error_message(e)
+                task.error_message = f"Could not get the direct download link. {detail}"
+            self.trigger_history_save()
+            return None
+        if task.cancel_flag or task.pause_flag:
+            return None  # cancel_selected/pause_selected already set the status
+        return url
 
     def download_worker(self, task):
         # App updates and any non-resolver (general direct) URL download straight
-        # over HTTP via urllib. Only FuckingFast/DataNodes-style links go through
-        # the Turnstile/CAPTCHA solver + curl transport, exactly as before.
+        # over HTTP via urllib; form hosts (FileKeeper) first trade the page for
+        # a direct link over plain HTTP. Only FuckingFast/DataNodes-style links
+        # go through the Turnstile/CAPTCHA solver + curl transport.
         if getattr(task, "is_update", False) or not needs_resolution(task.link):
-            self._download_direct_file(task)
+            url = None
+            if not getattr(task, "is_update", False) and needs_form_resolution(task.link):
+                url = self._resolve_form_link(task)
+                if not url:
+                    return
+            self._download_direct_file(task, url)
             return
 
         dl_url = self.get_direct_link(task)

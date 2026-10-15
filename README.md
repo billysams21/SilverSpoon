@@ -1,12 +1,13 @@
 # SilverSpoon (previously FitGirlDownloader)
 
-> **Note:** `fuckingfast.co` and `datanodes.to` links (commonly used by FitGirl Repacks and direct download mirrors) go through the built-in Cloudflare Turnstile solver. Since v1.6.0 any other plain `http(s)` direct link is downloaded straight away, with the same pause/resume/progress support.
+> **Note:** `fuckingfast.co` and `datanodes.to` links (commonly used by FitGirl Repacks and direct download mirrors) go through the built-in Cloudflare Turnstile solver, and `filekeeper.net` links are resolved automatically (no browser needed). Since v1.6.0 any other plain `http(s)` direct link is downloaded straight away, with the same pause/resume/progress support.
 
 A Python-based bulk downloader designed to bypass Cloudflare protections on file-hosting sites like *fuckingfast.co* and *datanodes.to*, and to queue ordinary direct download links alongside them. It automates the process of extracting direct download links and supports concurrent downloading with pause and resume capabilities.
 
 ## Features
 
 * **Auto-Updater:** (Windows only) Checks for new releases on launch (or via `Help -> Check for Updates...`). An update is added to your normal download queue — start, pause and resume it like any other task; it saves to your Save-To folder and skips the CAPTCHA step. When it finishes, choose **Install now** (restart) or **Install on next open**.
+* **FileKeeper Support:** `filekeeper.net` links (FitGirl mirrors) wait out the host's countdown and fetch the direct link over plain HTTP, then download with resume, pause and progress; a fresh link is fetched each time a download starts or resumes.
 * **General Direct-URL Downloads:** Any link whose host isn't a Turnstile-protected provider is downloaded directly over HTTP with resume, pause and progress — the queue is not limited to FuckingFast/DataNodes.
 * **Cross-Platform Extraction:** Built-in auto-extraction support for Windows (bundled `7z`), as well as Linux and macOS (via `/usr/bin/7z` / `p7zip`).
 * **Cloudflare Turnstile Bypass:** Uses a hidden Chromium browser (via `nodriver`) to auto-solve Cloudflare Turnstile challenges invisibly, then downloads via `curl_cffi` with TLS impersonation. No manual CAPTCHA solving needed for normal IPs. A failed resolution tears the browser down instead of reusing a broken one, so Chromium no longer re-spawns endlessly.

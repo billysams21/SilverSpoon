@@ -338,6 +338,58 @@ class TurnstileSolver:
             )
         return direct_url
 
+    #   step 1  "Continue to Download" (#method_free, enabled after a short
+    #           "Preparing File" animation) -> form POST op=download1
+    #   step 2  Turnstile widget; the button only renders once it passes:
+    #           "Free Download" -> countdown ("Ready in Ns") -> "Start Download"
+    #           -> fetch POST op=download2 answering JSON {url}
+    # Each page load wipes window state, so the fetch hook is (re)installed on
+    # every tick. The hook keeps the URL and hands the page an empty reply, so
+    # the solver's own browser never starts downloading the file itself.
+    _DATANODES_STEP_JS = """
+        JSON.stringify((() => {
+            if (!window.__dn_hooked) {
+                window.__dn_hooked = true;
+                window.__dn_direct_url = null;
+                const origFetch = window.fetch;
+                window.fetch = async function(...args) {
+                    const resp = await origFetch.apply(this, args);
+                    try {
+                        const data = await resp.clone().json();
+                        if (data && data.url) {
+                            window.__dn_direct_url = decodeURIComponent(data.url);
+                            return new Response('{}', {status: 200, headers: {'Content-Type': 'application/json'}});
+                        }
+                    } catch (e) {}
+                    return resp;
+                };
+            }
+            if (window.__dn_direct_url) {
+                return {url: window.__dn_direct_url};
+            }
+            const links = Array.from(document.querySelectorAll('a')).map(a => a.href).filter(h => h && (h.includes('dlproxy') || h.includes('.rar') || (h.includes(':8080') && !h.includes('datanodes.to/app'))));
+            if (links.length) {
+                return {url: links[0]};
+            }
+            const hasCaptcha = !!document.querySelector('.cf-turnstile, iframe[src*="turnstile"]');
+            const btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+            for (const b of btns) {
+                // First line only: the buttons carry a subtitle ("Standard speed").
+                const txt = (b.innerText || b.value || '').trim().split('\\n')[0].trim();
+                if (!/^(Continue to Download|Free Download|Start Download)/i.test(txt)) continue;
+                // Disabled while "Preparing File" runs; give a click 5 s to take effect.
+                if (b.disabled || !b.offsetParent || Date.now() - (+b.dataset.dnClicked || 0) < 5000) {
+                    return {waiting: txt, hasCaptcha};
+                }
+                b.dataset.dnClicked = Date.now();
+                b.scrollIntoView({behavior: 'instant', block: 'center'});
+                b.click();
+                return {clicked: txt, hasCaptcha};
+            }
+            return {hasCaptcha};
+        })())
+    """
+
     async def _resolve_datanodes_async(self, link, tab):
         direct_url = None
 
@@ -351,87 +403,49 @@ class TurnstileSolver:
         tab.add_handler(cdp.network.ResponseReceived, on_network_response)
         await tab.send(cdp.network.enable())
 
-        # Intercept fetch responses in page context as well
-        await tab.evaluate("""
-            (() => {
-                window.__dn_direct_url = null;
-                const origFetch = window.fetch;
-                window.fetch = async function(...args) {
-                    const resp = await origFetch.apply(this, args);
-                    try {
-                        const clone = resp.clone();
-                        const data = await clone.json();
-                        if (data && data.url) {
-                            window.__dn_direct_url = decodeURIComponent(data.url);
-                        }
-                    } catch(e) {}
-                    return resp;
-                };
-            })();
-        """)
-
-        logger.info("TurnstileSolver (DataNodes): waiting for Turnstile & Free Download button...")
-        clicked_free = False
-        button_timeout = max(30, self.TOKEN_TIMEOUT + 15)
-        for i in range(button_timeout):
-            if self._stop_requested:
-                raise RuntimeError("Solver stopped while waiting for DataNodes download button.")
-            await asyncio.sleep(1)
-            raw = await tab.evaluate("""
-                JSON.stringify((() => {
-                    const btns = Array.from(document.querySelectorAll('button, a, input[type="submit"]'));
-                    for (const b of btns) {
-                        const txt = (b.innerText || b.value || '').trim();
-                        if (/^Free Download/i.test(txt) || txt.startsWith('Free Download')) {
-                            b.scrollIntoView({behavior: 'instant', block: 'center'});
-                            b.click();
-                            return {clicked: true, text: txt};
-                        }
-                    }
-                    return {clicked: false};
-                })())
-            """)
-            try:
-                res = json.loads(raw)
-                if res.get("clicked"):
-                    logger.info("TurnstileSolver (DataNodes): clicked 'Free Download' button (%s)", res.get("text"))
-                    clicked_free = True
-                    break
-            except Exception:
-                pass
-
-        if not clicked_free:
-            raise RuntimeError("Could not find or click 'Free Download' button on DataNodes. Cloudflare challenge may have timed out or IP may be flagged.")
-
-        logger.info("TurnstileSolver (DataNodes): waiting out countdown for direct download URL...")
-        for sec in range(30):
+        logger.info("TurnstileSolver (DataNodes): working through download steps...")
+        # Step 1 animation (~10 s) + Turnstile + countdown (~10 s) + POST.
+        captcha_timeout = max(30, self.TOKEN_TIMEOUT + 15)
+        deadline = asyncio.get_running_loop().time() + captcha_timeout + 45
+        captcha_since = None
+        state = {}
+        while not direct_url:
             if self._stop_requested:
                 raise RuntimeError("Solver stopped while waiting for DataNodes download link.")
-            await asyncio.sleep(1)
-            if direct_url:
+            now = asyncio.get_running_loop().time()
+            if now > deadline:
                 break
-                
-            # Check intercepted fetch or DOM links
-            raw_check = await tab.evaluate("""
-                JSON.stringify((() => {
-                    if (window.__dn_direct_url) {
-                        return {url: window.__dn_direct_url};
-                    }
-                    const links = Array.from(document.querySelectorAll('a')).map(a => a.href).filter(h => h && (h.includes('dlproxy') || h.includes('.rar') || (h.includes(':8080') && !h.includes('datanodes.to/app'))));
-                    return {url: links.length ? links[0] : null};
-                })())
-            """)
+            await asyncio.sleep(1)
             try:
-                check_data = json.loads(raw_check)
-                if check_data.get("url"):
-                    direct_url = check_data.get("url")
-                    logger.info("TurnstileSolver (DataNodes): captured direct URL from page state: %s", direct_url[:60])
-                    break
+                state = json.loads(await tab.evaluate(self._DATANODES_STEP_JS)) or {}
             except Exception:
-                pass
+                # Mid-navigation (step 1 submits a form); try again next tick.
+                continue
+
+            if state.get("url"):
+                direct_url = state["url"]
+                logger.info("TurnstileSolver (DataNodes): captured direct URL from page state: %s", direct_url[:60])
+                break
+            if state.get("clicked"):
+                logger.info("TurnstileSolver (DataNodes): clicked '%s'", state["clicked"])
+
+            # Turnstile showing with no download button yet means it hasn't passed.
+            if state.get("hasCaptcha") and not (state.get("clicked") or state.get("waiting")):
+                captcha_since = captcha_since or now
+                if now - captcha_since > captcha_timeout:
+                    raise RuntimeError(
+                        f"DataNodes Turnstile did not pass after {captcha_timeout} seconds. "
+                        "Your IP may be flagged or the site may require an interactive challenge."
+                    )
+            else:
+                captcha_since = None
 
         if not direct_url:
-            raise RuntimeError("DataNodes did not produce a direct download link after the countdown.")
+            raise RuntimeError(
+                "DataNodes did not produce a direct download link "
+                f"(last step seen: {state.get('clicked') or state.get('waiting') or 'no download button'}). "
+                "The page layout may have changed."
+            )
 
         return direct_url
 

@@ -2,14 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
-## [v1.5.5] - 2026-09-08
+## [v1.6.0] - 2026-10-16
 
 ### New Features
-* **General Direct-URL Downloads**: Any link whose host isn't a Cloudflare/Turnstile provider (FuckingFast, DataNodes) now downloads straight over HTTP with resume/pause/progress — the queue is no longer limited to those providers. FuckingFast and DataNodes links still go through the Turnstile solver exactly as before.
+* **Extraction Progress Bar**: Auto-extraction and "Extract Now" show live progress in the task and batch rows (a violet bar, so it reads differently from a download). Folders with several archives are weighted by unpacked size so the bar moves evenly.
+* **Skip Already-Extracted Archives**: Before auto-extracting, SilverSpoon checks the archive contents against the folder. If every file is already there with the right size (extracted earlier, outside the app, or before the history was reset), the batch is simply marked **Extracted** instead of being unpacked again. A partial or interrupted extraction is still redone.
+* **Cancel Extraction**: **Cancel** (or Delete) on an extracting task stops the extractor and marks it **Extract Cancelled**; auto-extract won't restart it, and **Extract Now** can resume it later.
+* **Re-extract Confirmation**: **Extract Now** on a batch that's already extracted asks before overwriting the existing files.
+* **General Direct-URL Downloads**: Any link whose host isn't a Cloudflare/Turnstile provider (FuckingFast, DataNodes) now downloads straight over HTTP with resume/pause/progress — the queue is no longer limited to those providers. FuckingFast and DataNodes links still go through the Turnstile solver.
+* **Single Instance**: Opening SilverSpoon while it's already running shows a notice instead of starting a second copy that could corrupt the shared queue and partial files. Scheduled wake launches exit silently if the app is already open.
+* **Linux Browser Detection**: The Turnstile solver finds Playwright's Chromium on Linux (current `chrome-linux64` / `chrome-linux-arm64` and older `chrome-linux` layouts) and falls back to system Chrome, Chromium, Brave or Edge.
 
 ### Fixes & Improvements
+* **DataNodes Downloads Fixed**: DataNodes changed its download page to a two-step flow ("Continue to Download", then Turnstile, "Free Download", a countdown and "Start Download"); links were timing out on every attempt. The solver now follows the new flow and no longer lets its own browser start downloading the file. A Turnstile that never passes is reported as a CAPTCHA Timeout, like FuckingFast.
 * **Updates download in the queue (no more crash):** The auto-updater no longer uses a separate modal downloader (which could crash mid-download on large releases). A new version is now added to your normal download queue — start it when you like, and pause/resume it like any other download; it saves to your Save-To folder. When it finishes, choose **Install now** (restart) or **Install on next open**; a deferred update is offered again the next time you launch. Update downloads skip the Cloudflare/CAPTCHA step and are never auto-extracted.
 * **Solver No Longer Spawns Endless Browsers**: A failed link resolution now tears the browser down instead of leaving a broken one to be reused, so Chromium no longer keeps re-spawning without ever reaching the download page; CAPTCHA timeouts are no longer auto-retried.
+* **Safe Filenames for Direct Links**: Direct links with a query string (signed CDN URLs, `?id=` links) no longer produce file names Windows can't create, and a port or user name in a FuckingFast/DataNodes link no longer skips the solver.
+* **Batch Status While Extracting**: A batch that's extracting now shows **Extracting...** instead of falling back to **Queued**.
 * **Status Pill Overflow**: The STATUS tag no longer overflows into the PROGRESS column for long statuses (e.g. "Solving CAPTCHA...") — it's clamped to its column and elided.
 * **Release CI**: Fixed the Windows build workflow so it actually produces and attaches the release `.zip` (added `contents: write` permission; resolve bundled Chromium via Playwright's own path instead of a fragile glob; verify the bundle before zipping).
 

@@ -449,7 +449,7 @@ from ui_style import button_style
 from providers import needs_resolution, filename_from_link, RESOLVER_HOSTS
 from extraction import list_archive, is_extracted, run_with_progress, ExtractionCancelled
 
-CURRENT_VERSION = "v1.5.5"
+CURRENT_VERSION = "v1.6.0"
 GITHUB_REPO = "billysams21/SilverSpoon"
 
 def get_settings_path():
@@ -1614,10 +1614,21 @@ class MainWindow(QMainWindow):
 
     def show_about_dialog(self):
         QMessageBox.about(self, "About SilverSpoon",
-            "<h3>SilverSpoon v1.5.1</h3>"
+            f"<h3>SilverSpoon {CURRENT_VERSION}</h3>"
             "<p>A simple, fast bulk downloader for FuckingFast and DataNodes links developed by billysams21.</p>"
             "<p>Select your links, paste them in, and hit Add!</p>"
             "<p>Licensed under the GNU GPLv3.</p>"
+            "<hr>"
+            "<h4>Changelog (v1.6.0 - Short):</h4>"
+            "<ul>"
+            "<li><b>New:</b> Extraction progress bar, cancellable extraction, and a confirmation before re-extracting.</li>"
+            "<li><b>New:</b> Auto-extract skips archives that are already extracted.</li>"
+            "<li><b>New:</b> Any direct download link can be queued, not just FuckingFast/DataNodes.</li>"
+            "<li><b>New:</b> Updates download through the normal queue; install now or on next open.</li>"
+            "<li><b>New:</b> Only one copy of SilverSpoon runs at a time.</li>"
+            "<li><b>Fix:</b> DataNodes links work again with DataNodes' new two-step download page.</li>"
+            "<li><b>Fix:</b> A failed resolution no longer keeps re-spawning the browser.</li>"
+            "</ul>"
             "<hr>"
             "<h4>Changelog (v1.5.1 - Short):</h4>"
             "<ul>"
@@ -1625,16 +1636,6 @@ class MainWindow(QMainWindow):
             "<li><b>New:</b> Smart URL and filename unquoting for clean batch folders and task names.</li>"
             "<li><b>Fix:</b> Optimized executable build footprint, saving ~187 MB uncompressed.</li>"
             "<li><b>Fix:</b> Build script safety to prevent binary lock errors during packaging.</li>"
-            "</ul>"
-            "<hr>"
-            "<h4>Changelog (v1.5.0 - Short):</h4>"
-            "<ul>"
-            "<li><b>New:</b> Bento Card UI with full Dark and Light theme engine.</li>"
-            "<li><b>New:</b> Live rolling speed waveform graph in the status header.</li>"
-            "<li><b>New:</b> Download Scheduler with 12h time pickers, per-download scheduling, and wake timers.</li>"
-            "<li><b>New:</b> Armed schedule clock indicator with live hover info.</li>"
-            "<li><b>Fix:</b> Smart clipboard link extractor supporting rich HTML tables.</li>"
-            "<li><b>Fix:</b> Completed batches automatically collapse on app startup.</li>"
             "</ul>"
             "<hr>"
             "<p><i>See CHANGELOG.md for full details.</i></p>"

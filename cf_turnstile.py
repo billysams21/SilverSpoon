@@ -32,7 +32,10 @@ def find_browsers():
     
     pw_roots = [
         (os.path.join(la, "ms-playwright"), "chrome-win64", "chrome.exe"),
-        (os.path.expanduser("~/.cache/ms-playwright"), "chrome-linux", "chrome"),
+        # Newer Playwright (Chrome for Testing builds) uses chrome-linux64 / chrome-linux-arm64;
+        # older releases used chrome-linux.
+        *((os.path.expanduser("~/.cache/ms-playwright"), sub, "chrome")
+          for sub in ("chrome-linux64", "chrome-linux-arm64", "chrome-linux")),
     ]
     for pw_root, pw_sub, pw_exe in pw_roots:
         if not os.path.isdir(pw_root):

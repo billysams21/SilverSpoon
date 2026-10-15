@@ -6,6 +6,7 @@ import re
 import subprocess
 import json
 import logging
+import logging.handlers
 import tempfile
 import contextlib
 import zipfile
@@ -16,8 +17,13 @@ import urllib.error
 import urllib.parse
 from collections import deque
 
+LOG_PATH = os.path.expanduser("~/.silverspoon.log")
+# Rotate so the log can't grow without bound: 1 MB per file, 5 backups
+# (.silverspoon.log.1 ... .5). delay=True avoids creating an empty log.
 logging.basicConfig(
-    filename=os.path.expanduser("~/.silverspoon.log"),
+    handlers=[logging.handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=1_000_000, backupCount=5,
+        encoding='utf-8', delay=True)],
     level=logging.ERROR,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
@@ -949,6 +955,10 @@ class DownloadTask:
         # and, once complete, offer to install instead of being extracted.
         self.is_update = False
         self.update_version = None
+        # Set once the install prompt has been answered (incl. "Not yet") so it
+        # isn't shown again on every launch; installing later goes through the
+        # task's "Install Update" menu item.
+        self.install_handled = False
 
         # Extraction progress (0-100) while status is "Extracting...", or None
         # when the extractor doesn't report one. Not persisted.
@@ -966,7 +976,8 @@ class DownloadTask:
             "total_bytes": self.total_bytes,
             "progress": self.progress,
             "is_update": self.is_update,
-            "update_version": self.update_version
+            "update_version": self.update_version,
+            "install_handled": self.install_handled
         }
         
     @classmethod
@@ -989,6 +1000,7 @@ class DownloadTask:
         task.error_message = data.get("error_message", "")
         task.is_update = data.get("is_update", False)
         task.update_version = data.get("update_version")
+        task.install_handled = data.get("install_handled", False)
         return task
 
 def get_history_path():
@@ -1078,6 +1090,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(1500, self.scheduler_tick)
 
         self._refresh_schedule_indicator()
+        self._refresh_wake_task()
 
         # Offer to finish installing an update that was deferred to "next open".
         QTimer.singleShot(1200, self._check_pending_update)
@@ -1448,6 +1461,8 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction("Extract Now", self.manual_extract_selected)
         menu.addAction("Open Folder", self.open_selected_folder)
+        if any(t.is_update and t.status == "Completed" for t in self.get_selected_tasks()):
+            menu.addAction("Install Update", self.install_selected_update)
         menu.addSeparator()
         menu.addAction("[R] Retry", self.retry_selected)
         menu.addAction("[F] Force Redownload", self.force_redownload_selected)
@@ -1530,14 +1545,18 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "No Error Selected", "Select a failed task first, then copy its error details.")
 
     def copy_error_log(self, task):
-        log_path = os.path.expanduser("~/.silverspoon.log")
-        if not os.path.exists(log_path):
+        # Read the newest backup too, so a rollover right after the failure
+        # doesn't hide its lines. Oldest first, matching the log's own order.
+        log_paths = [p for p in (LOG_PATH + ".1", LOG_PATH) if os.path.exists(p)]
+        if not log_paths:
             QMessageBox.information(self, "No Log", "No error log found.")
             return
             
         try:
-            with open(log_path, 'r', encoding='utf-8') as f:
-                logs = f.readlines()
+            logs = []
+            for log_path in log_paths:
+                with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+                    logs.extend(f.readlines())
                 
             keywords = [task.link, task.file_id, task.filename]
             # Filter out INFO level logs, keep ERROR, WARNING, CRITICAL or exception tracebacks
@@ -1868,11 +1887,23 @@ class MainWindow(QMainWindow):
         pending_v = (self.settings.get("pending_update") or {}).get("version")
         for t in self.tasks:
             if (getattr(t, "is_update", False) and t.status == "Completed"
-                    and not getattr(t, "_install_handled", False)
+                    and not t.install_handled
                     and t.update_version != pending_v
                     and os.path.exists(t.filepath)):
-                t._install_handled = True
+                t.install_handled = True
+                # Save now, not debounced: "Install now" quits the app.
+                save_history(self.tasks)
                 self._prompt_install(t)
+
+    def install_selected_update(self):
+        """Context menu: install a downloaded update the user put off earlier."""
+        for t in self.get_selected_tasks():
+            if t.is_update and t.status == "Completed" and os.path.exists(t.filepath):
+                self._prompt_install(t)
+                return
+        QMessageBox.information(
+            self, "No Update Selected",
+            "Select a completed SilverSpoon update download first.")
 
     def _prompt_install(self, task):
         box = QMessageBox(self)
@@ -1971,6 +2002,25 @@ class MainWindow(QMainWindow):
             offpeak.unregister_wake_task()
 
         self._refresh_schedule_indicator()
+
+    def _refresh_wake_task(self):
+        """On startup, re-register an enabled wake task so it uses the current
+        launch command (e.g. --background); older tasks were only updated when
+        the schedule dialog was saved. Silent and off the UI thread (PowerShell
+        is slow); Register-ScheduledTask -Force replaces the task in place."""
+        if sys.platform != "win32":
+            return
+        if not (self.schedule.get("enabled") and self.schedule.get("wake_timer")):
+            return
+        sched = dict(self.schedule)
+        executable, arguments = self._launch_command()
+
+        def worker():
+            ok, msg = offpeak.register_wake_task(sched, executable, arguments)
+            if not ok:
+                logging.error("Could not refresh the wake timer task: %s", msg)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _refresh_schedule_indicator(self):
         """Alt C: compact dot. Hidden when disabled; hover shows the full text."""
@@ -2351,6 +2401,8 @@ class MainWindow(QMainWindow):
             task.total_bytes = 0
             task.error_message = ""
             task.status = "Pending"
+            # A fresh download of an update asks again when it completes.
+            task.install_handled = False
             self.extracted_folders.discard(task.folder_name)
             redownloaded += 1
 

@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -116,8 +117,12 @@ class TurnstileSolver:
         if self._browser:
             try:
                 logger.info("TurnstileSolver: stopping browser")
-                # Stop can hang if the browser is completely frozen
-                await asyncio.wait_for(self._browser.stop(), timeout=3.0)
+                # nodriver's stop() is synchronous (it terminates the process
+                # itself); only await it if a version returns a coroutine. The
+                # timeout guards against that hanging on a frozen browser.
+                result = self._browser.stop()
+                if inspect.isawaitable(result):
+                    await asyncio.wait_for(result, timeout=3.0)
             except Exception as e:
                 logger.error("TurnstileSolver: error stopping browser gracefully: %s", e)
                 # Force kill the underlying process if gracefully stopping failed

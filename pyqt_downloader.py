@@ -36,7 +36,7 @@ from PyQt6.QtGui import (
     QKeySequence, QPalette, QPainter, QLinearGradient, QPen, QFont,
     QPainterPath
 )
-from PyQt6.QtCore import Qt, QTimer, QUrl, QEvent, QRectF, QSize, QPointF, QDate, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QUrl, QEvent, QRectF, QSize, QPointF, QDate, pyqtSignal, QLockFile
 from theme_styles import DARK_THEME_QSS, LIGHT_THEME_QSS
 
 class LiveSpeedGraph(QWidget):
@@ -1976,8 +1976,8 @@ class MainWindow(QMainWindow):
     def _launch_command(self):
         """Executable + argument string used by the wake task to relaunch the app."""
         if getattr(sys, "frozen", False):
-            return sys.executable, ""
-        return sys.executable, f'"{os.path.abspath(__file__)}"'
+            return sys.executable, "--background"
+        return sys.executable, f'"{os.path.abspath(__file__)}" --background'
 
     def _task_key(self, task):
         # Stable uid, not link: two tasks can share a link (re-added/duplicate),
@@ -3109,7 +3109,32 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    
+
+    # Single-instance guard: prevent two copies from corrupting shared state
+    _background_launch = "--background" in sys.argv
+    # Lives next to the settings/history files it protects, so it is per-user
+    # (a shared /tmp would let one user's instance block another's).
+    _lock_path = os.path.expanduser("~/.silverspoon.lock")
+    # If something else created a directory at our lock path, use a fallback so
+    # QLockFile's LockFailedError cannot be confused with a real running instance.
+    if os.path.isdir(_lock_path):
+        _lock_path = os.path.expanduser("~/.silverspoon2.lock")
+    _lock = QLockFile(_lock_path)
+    _lock.setStaleLockTime(30 * 1000)  # treat locks older than 30 s (after a crash) as stale
+    if not _lock.tryLock(0):
+        if _lock.error() == QLockFile.LockError.LockFailedError:
+            # Another live instance owns the lock.
+            if not _background_launch:
+                from PyQt6.QtWidgets import QMessageBox
+                msg = QMessageBox()
+                msg.setWindowTitle("SilverSpoon")
+                msg.setText("SilverSpoon is already running.\nPlease use the existing instance.")
+                msg.setIcon(QMessageBox.Icon.Warning)
+                msg.exec()
+            sys.exit(1)
+        # Permission / unknown error — can't create the lock file but no other instance
+        # is confirmed running, so allow the app to start in degraded (unprotected) mode.
+
     # Load settings to apply initial theme
     initial_settings = load_settings()
     apply_theme(app, initial_settings.get("theme", "Dark"))

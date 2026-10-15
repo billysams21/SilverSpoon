@@ -2887,11 +2887,13 @@ if __name__ == "__main__":
 
     # Single-instance guard: prevent two copies from corrupting shared state
     _background_launch = "--background" in sys.argv
-    _lock_path = os.path.join(tempfile.gettempdir(), "silverspoon.lock")
+    # Lives next to the settings/history files it protects, so it is per-user
+    # (a shared /tmp would let one user's instance block another's).
+    _lock_path = os.path.expanduser("~/.silverspoon.lock")
     # If something else created a directory at our lock path, use a fallback so
     # QLockFile's LockFailedError cannot be confused with a real running instance.
     if os.path.isdir(_lock_path):
-        _lock_path = os.path.join(tempfile.gettempdir(), "silverspoon2.lock")
+        _lock_path = os.path.expanduser("~/.silverspoon2.lock")
     _lock = QLockFile(_lock_path)
     _lock.setStaleLockTime(30 * 1000)  # treat locks older than 30 s (after a crash) as stale
     if not _lock.tryLock(0):

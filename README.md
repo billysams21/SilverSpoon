@@ -7,6 +7,7 @@ A Python-based bulk downloader designed to bypass Cloudflare protections on file
 ## Features
 
 * **Auto-Updater:** (Windows only) Checks for new releases on launch (or via `Help -> Check for Updates...`). An update is added to your normal download queue — start, pause and resume it like any other task; it saves to your Save-To folder and skips the CAPTCHA step. When it finishes, choose **Install now** (restart) or **Install on next open**.
+* **Multi-Connection Downloads:** Direct links download over several parallel connections (default 4, configurable in Settings) with resume across pauses and restarts, falling back to a single connection when the server doesn't support it.
 * **FileKeeper Support:** `filekeeper.net` links (FitGirl mirrors) wait out the host's countdown and fetch the direct link over plain HTTP, then download with resume, pause and progress; a fresh link is fetched each time a download starts or resumes.
 * **General Direct-URL Downloads:** Any link whose host isn't a Turnstile-protected provider is downloaded directly over HTTP with resume, pause and progress — the queue is not limited to FuckingFast/DataNodes.
 * **Cross-Platform Extraction:** Built-in auto-extraction support for Windows (bundled `7z`), as well as Linux and macOS (via `/usr/bin/7z` / `p7zip`).

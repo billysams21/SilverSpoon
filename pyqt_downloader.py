@@ -457,6 +457,7 @@ from providers import (
     filename_from_link, RESOLVER_HOSTS,
 )
 from extraction import list_archive, is_extracted, run_with_progress, ExtractionCancelled
+from segmented import SegmentedDownload, probe as probe_ranges, state_path as segment_state_path, MIN_SEGMENT
 
 CURRENT_VERSION = "v1.6.0"
 GITHUB_REPO = "billysams21/SilverSpoon"
@@ -479,6 +480,7 @@ def load_settings():
         "theme": "Dark",
         "default_save_dir": default_downloads,
         "max_workers": 3,
+        "max_connections": 4,
         "extract_after_download": False,
         "auto_retry_errors": False,
         "captcha_timeout": 10,
@@ -653,6 +655,15 @@ class SettingsDialog(QDialog):
         self.workers_spinbox.setRange(1, 10)
         self.workers_spinbox.setValue(self.current_settings.get("max_workers", 3))
         layout.addRow("Max Concurrent Downloads:", self.workers_spinbox)
+
+        # Connections per download (segmented direct downloads; 1 = off)
+        self.connections_spinbox = QSpinBox()
+        self.connections_spinbox.setRange(1, 16)
+        self.connections_spinbox.setValue(self.current_settings.get("max_connections", 4))
+        self.connections_spinbox.setToolTip(
+            "Parallel connections per file for direct links (FileKeeper and other "
+            "plain download links). 1 turns multi-connection downloads off.")
+        layout.addRow("Connections per Download:", self.connections_spinbox)
         
         # Bandwidth Limit
         self.bandwidth_spinbox = QSpinBox()
@@ -712,6 +723,7 @@ class SettingsDialog(QDialog):
             self.dir_input.setText(default_dir)
             self.theme_combo.setCurrentText("Dark")
             self.workers_spinbox.setValue(3)
+            self.connections_spinbox.setValue(4)
             self.bandwidth_spinbox.setValue(0)
             self.captcha_spinbox.setValue(10)
             self.extract_checkbox.setChecked(False)
@@ -727,6 +739,7 @@ class SettingsDialog(QDialog):
             "theme": self.theme_combo.currentText(),
             "default_save_dir": self.dir_input.text(),
             "max_workers": self.workers_spinbox.value(),
+            "max_connections": self.connections_spinbox.value(),
             "bandwidth_limit": self.bandwidth_spinbox.value(),
             "captcha_timeout": self.captcha_spinbox.value(),
             "extract_after_download": self.extract_checkbox.isChecked(),
@@ -1643,6 +1656,7 @@ class MainWindow(QMainWindow):
             "<hr>"
             "<h4>Changelog (v1.6.0 - Short):</h4>"
             "<ul>"
+            "<li><b>New:</b> Multi-connection downloads for direct links (Settings → Connections per Download).</li>"
             "<li><b>New:</b> FileKeeper (<code>filekeeper.net</code>) links are supported.</li>"
             "<li><b>New:</b> Extraction progress bar, cancellable extraction, and a confirmation before re-extracting.</li>"
             "<li><b>New:</b> Auto-extract skips archives that are already extracted.</li>"
@@ -2387,6 +2401,8 @@ class MainWindow(QMainWindow):
             try:
                 if os.path.exists(task.filepath):
                     os.remove(task.filepath)
+                if os.path.exists(segment_state_path(task.filepath)):
+                    os.remove(segment_state_path(task.filepath))
             except Exception as e:
                 failed += 1
                 task.status = "Error"
@@ -2458,6 +2474,8 @@ class MainWindow(QMainWindow):
             if delete_files and os.path.exists(task.filepath):
                 try:
                     os.remove(task.filepath)
+                    if os.path.exists(segment_state_path(task.filepath)):
+                        os.remove(segment_state_path(task.filepath))
                 except Exception as e:
                     logging.error("Failed to delete %s: %s", task.filepath, e)
 
@@ -2997,9 +3015,13 @@ class MainWindow(QMainWindow):
             self.trigger_history_save()
             return
 
+        url = url or task.link
+        headers = {"User-Agent": f"SilverSpoon/{CURRENT_VERSION}"}
+        if self._download_segmented(task, url, headers):
+            return
+
         initial_size = os.path.getsize(task.filepath) if os.path.exists(task.filepath) else 0
-        req = urllib.request.Request(
-            url or task.link, headers={"User-Agent": f"SilverSpoon/{CURRENT_VERSION}"})
+        req = urllib.request.Request(url, headers=headers)
         if initial_size > 0:
             req.add_header("Range", f"bytes={initial_size}-")
 
@@ -3064,6 +3086,76 @@ class MainWindow(QMainWindow):
             self._update_download_failed(task, he)
         except Exception as e:
             self._update_download_failed(task, e)
+
+    def _download_segmented(self, task, url, headers):
+        """Download over several connections when the server supports ranges.
+        Returns True when it handled the task (finished, paused, cancelled or
+        failed) and False to fall back to the single-connection path."""
+        connections = max(1, int(self.settings.get("max_connections", 4)))
+        state = segment_state_path(task.filepath)
+        resuming = os.path.exists(state)
+        if connections <= 1 and not resuming:
+            return False
+        try:
+            total, ranges = probe_ranges(url, headers)
+        except Exception as e:
+            if not resuming:
+                return False  # let the single-connection path report it
+            self._update_download_failed(task, e)
+            return True
+        if not ranges or total <= 0:
+            if resuming:
+                # A half-done segmented file can't be continued without ranges;
+                # its size isn't the downloaded byte count, so start over.
+                for p in (state, task.filepath):
+                    if os.path.exists(p):
+                        os.remove(p)
+            return False
+        if total < 2 * MIN_SEGMENT and not resuming:
+            return False  # too small to be worth splitting
+
+        task.status = "Downloading"
+        task.error_message = ""
+        task.total_bytes = total
+        samples = deque()
+
+        def on_progress(done):
+            now = time.time()
+            task.downloaded_bytes = done
+            task.progress = done / total * 100
+            samples.append((now, done))
+            while len(samples) > 1 and now - samples[0][0] > 3:
+                samples.popleft()
+            dur = now - samples[0][0]
+            if dur > 0:
+                task.speed = ((done - samples[0][1]) / dur) / (1024 * 1024)
+
+        # Same per-download share of the global limit as the curl transport.
+        limit_mb_s = self.settings.get("bandwidth_limit", 0)
+        max_workers = self.settings.get("max_workers", 3)
+        bytes_per_second = (limit_mb_s * 1024 * 1024) / max_workers if limit_mb_s > 0 and max_workers > 0 else 0
+
+        try:
+            finished = SegmentedDownload(
+                url, task.filepath, total, connections=connections, headers=headers,
+                should_stop=lambda: task.pause_flag or task.cancel_flag,
+                on_progress=on_progress, bytes_per_second=bytes_per_second,
+            ).run()
+        except Exception as e:
+            task.speed = 0
+            self._update_download_failed(task, e)
+            return True
+        task.speed = 0
+        if not finished:
+            # Progress is saved beside the file; Start/Resume continues it.
+            task.status = "Cancelled" if task.cancel_flag else "Paused"
+            return True
+        task.downloaded_bytes = total
+        task.progress = 100
+        task.status = "Completed"
+        task.error_message = ""
+        self.trigger_history_save()
+        return True
 
     def _update_download_failed(self, task, exc):
         logging.error("Direct download error for %s: %s", task.link, exc, exc_info=True)

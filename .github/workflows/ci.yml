@@ -10,6 +10,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # test_extraction.py needs a Linux 7-Zip (the repo's 7z.exe is Windows-only).
+      - name: Install 7-Zip
+        run: command -v 7z || (sudo apt-get update && sudo apt-get install -y 7zip)
       - name: Compile all
         run: python -m compileall -q .
       - name: Run headless tests

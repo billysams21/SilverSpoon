@@ -1,18 +1,22 @@
 """Headless checks for the extraction helpers. Run: python test_extraction.py
 
-The listing/progress tests use the bundled 7z.exe (or a 7z on PATH) and are
-skipped when neither is available.
+The listing/progress tests use the bundled 7z.exe on Windows (a 7-Zip on PATH
+elsewhere) and are skipped when none is available.
 """
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 
 import extraction as X
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# The bundled 7z.exe only runs on Windows (on Linux CI it's "Permission denied").
+_CANDIDATES = ([os.path.join(HERE, "7z.exe")] if sys.platform == "win32" else []) + [
+    shutil.which(name) for name in ("7z", "7zz", "7za")]
 SEVEN_ZIP = next(
-    (p for p in (os.path.join(HERE, "7z.exe"), shutil.which("7z")) if p and os.path.isfile(p)),
+    (p for p in _CANDIDATES if p and os.path.isfile(p) and os.access(p, os.X_OK)),
     None,
 )
 

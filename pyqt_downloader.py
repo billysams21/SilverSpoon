@@ -2857,9 +2857,11 @@ class MainWindow(QMainWindow):
                 extractor_type = '7z'
                 base_cmd = bundled_7z
         else:
-            if shutil.which('7z'):
+            # 7z (p7zip, or Ubuntu's 7zip package); Debian 12's 7zip only has 7zz.
+            seven_zip_cmd = next((n for n in ('7z', '7zz', '7za') if shutil.which(n)), None)
+            if seven_zip_cmd:
                 extractor_type = '7z'
-                base_cmd = '7z'
+                base_cmd = seven_zip_cmd
             elif shutil.which('unrar'):
                 extractor_type = 'unrar'
                 base_cmd = 'unrar'
@@ -2869,7 +2871,7 @@ class MainWindow(QMainWindow):
         elif bundled_7z and os.path.exists(bundled_7z):
             seven_zip = bundled_7z
         else:
-            seven_zip = shutil.which('7z')
+            seven_zip = next((shutil.which(n) for n in ('7z', '7zz', '7za') if shutil.which(n)), None)
         return extractor_type, base_cmd, seven_zip
 
     def _already_extracted(self, tasks_in_folder):

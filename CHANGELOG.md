@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [v1.6.0] - 2026-10-16
+## [v1.6.0] - 2026-10-17
 
 ### New Features
 * **BZZHR (`bzzhr.to`) Support**: BZZHR links get through the site's Cloudflare check with the built-in solver (the browser pops up only if the check needs a click), then download with the direct downloader: multiple connections and resume. Uploads bzzhr only serves to visitors from the uploader's site (e.g. SteamRIP) are reopened with that site as the referrer, as a click there would. BZZHR links carry no file name, so the name the server sends is used (and kept across restarts) instead of the link's ID.

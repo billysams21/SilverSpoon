@@ -62,6 +62,31 @@ def test_form_hosts_are_routed_separately():
     assert P.filename_from_link(link) == "Game_--_fitgirl-repacks.site_--_.part01.rar"
 
 
+def test_bzzhr_goes_through_solver_then_direct_download():
+    link = "https://bzzhr.to/hjcobfz259jz"
+    assert P.needs_resolution(link) is True          # Cloudflare page needs the browser
+    assert P.download_resolved_directly(link) is True  # its file link needs no cookies
+    assert P.needs_form_resolution(link) is False
+    for other in ("https://fuckingfast.co/abc#x.rar", "https://datanodes.to/abc/x.rar"):
+        assert P.download_resolved_directly(other) is False
+    assert P.filename_from_link(link) == "hjcobfz259jz"  # hence the server-name lookup
+
+
+def test_filename_from_content_disposition():
+    for header, expected in (
+        ("attachment; filename=\"FIRE_AND_ASHES-SteamRIP.com.rar\"; "
+         "filename*=UTF-8''FIRE_AND_ASHES-SteamRIP.com.rar", "FIRE_AND_ASHES-SteamRIP.com.rar"),
+        ('attachment; filename="My Game.part01.rar"', "My Game.part01.rar"),
+        ("attachment; filename*=UTF-8''%E2%82%AC%20rates.zip", "€ rates.zip"),
+        ("attachment; filename=plain.zip", "plain.zip"),
+        ('attachment; filename="../../evil:name.rar"', "evil_name.rar"),
+        ("inline", None),
+        (None, None),
+        ('attachment; filename=""', None),
+    ):
+        assert P.filename_from_content_disposition(header) == expected, (header, P.filename_from_content_disposition(header))
+
+
 def test_parse_countdown():
     page = ('<div id="download-countdown" class="w-full"\n data-countdown="5"\n'
             ' data-code="16moao3mygr6" data-rand="" data-method="Free &amp; fast"\n'

@@ -7,6 +7,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import urllib.parse
 
 import nodriver
 import nodriver.cdp as cdp
@@ -217,7 +218,7 @@ class TurnstileSolver:
                 self._browser = None
         raise RuntimeError(f"No candidate browser could start. Last error: {last_err}")
 
-    async def _navigate(self, link):
+    async def _navigate(self, link, referrer=None):
         if self._tab is None:
             logger.info("TurnstileSolver: retained tab missing; recreating")
             try:
@@ -231,7 +232,11 @@ class TurnstileSolver:
             "TurnstileSolver: navigating tab to %s; targets_before=%s", link, targets_before,
         )
         try:
-            await asyncio.wait_for(tab.get(link), timeout=15.0)
+            if referrer:
+                # Same as following a link on the referrer's page.
+                await asyncio.wait_for(tab.send(cdp.page.navigate(url=link, referrer=referrer)), timeout=15.0)
+            else:
+                await asyncio.wait_for(tab.get(link), timeout=15.0)
             await asyncio.sleep(2)
         except Exception as e:
             logger.warning("TurnstileSolver: navigation timed out or failed (%s). Tab is likely dead.", e)
@@ -253,7 +258,10 @@ class TurnstileSolver:
         except Exception:
             page_url = ""
 
-        if not (page_url.startswith("https://fuckingfast.co/") or "datanodes.to" in page_url):
+        # bzzhr.to may send the browser to the uploader's site (e.g. steamrip.com);
+        # _resolve_bzzhr_async handles that, so it isn't a hijack there.
+        if not (page_url.startswith("https://fuckingfast.co/") or "datanodes.to" in page_url
+                or "bzzhr.to" in page_url or ("bzzhr.to" in link and page_url.startswith("http"))):
             logger.warning("TurnstileSolver: unexpected URL after navigation: %s; tab might be hijacked or blank.", page_url)
             self._tab = None
             raise RuntimeError("Tab hijacked or failed to load correct URL.")
@@ -513,6 +521,86 @@ class TurnstileSolver:
 
         return direct_url
 
+    # bzzhr.to: the whole site sits behind a Cloudflare "Just a moment..." page;
+    # past it, the file page's "Download File" button is an htmx GET
+    # (/<code>/download?t=<signed>) answering 204 with an HX-Redirect to the file.
+    _BZZHR_STATE_JS = """
+        JSON.stringify((() => {
+            const btn = document.querySelector('a.download-btn[hx-get]');
+            return {
+                origin: location.origin,
+                href: btn ? btn.getAttribute('hx-get') : null,
+                challenge: !btn && (/just a moment/i.test(document.title)
+                    || !!document.querySelector('iframe[src*="challenges.cloudflare.com"], [name="cf-turnstile-response"]')),
+            };
+        })())
+    """
+
+    async def _resolve_bzzhr_async(self, link, tab):
+        # Cloudflare gets reveal_after seconds to clear on its own, then the
+        # window is shown and the user gets USER_SOLVE_TIME more.
+        reveal_after = max(10, self.TOKEN_TIMEOUT)
+        challenge_timeout = reveal_after + self.USER_SOLVE_TIME
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        challenge_since = None
+        href = None
+        partner = None
+        parsed = urllib.parse.urlparse(link)
+        link_origin = f"{parsed.scheme}://{parsed.netloc}"
+        while href is None:
+            if self._stop_requested:
+                raise RuntimeError("Solver stopped while waiting for the bzzhr.to page.")
+            await asyncio.sleep(1)
+            now = loop.time()
+            try:
+                state = json.loads(await tab.evaluate(self._BZZHR_STATE_JS)) or {}
+            except Exception:
+                continue  # mid-navigation (the challenge reloads the page)
+            if state.get("href"):
+                href = state["href"]
+                break
+            if state.get("origin") and state["origin"] != link_origin:
+                # bzzhr only serves a partner's upload to visitors coming from
+                # the partner's site; anyone else is sent there (seen: SteamRIP
+                # files -> steamrip.com). Come back the way a click on that site
+                # would, with it as the referrer.
+                if partner:
+                    raise RuntimeError(
+                        f"bzzhr.to keeps sending the browser to {state.get('origin')} instead of the file page.")
+                partner = state["origin"] + "/"
+                logger.info("TurnstileSolver (bzzhr): sent to %s; reopening the link with it as referrer", partner)
+                tab = await self._navigate(link, referrer=partner)
+                start, challenge_since = loop.time(), None
+                continue
+            if state.get("challenge"):
+                challenge_since = challenge_since or now
+                if now - challenge_since > reveal_after and not self._revealed:
+                    await self._ask_user(tab)
+                if now - challenge_since > challenge_timeout:
+                    raise RuntimeError(
+                        f"bzzhr.to's Cloudflare check was not completed after {challenge_timeout} seconds. "
+                        "Your IP may be flagged, or the check in the browser window wasn't completed.")
+            elif now - start > 30:
+                raise RuntimeError(
+                    "The bzzhr.to page has no download button. The file may have been removed, "
+                    "or the page layout changed.")
+        await self._user_done(tab)
+        logger.info("TurnstileSolver (bzzhr): page ready; requesting download link")
+
+        raw = await tab.evaluate(
+            "(async () => { const r = await fetch(" + json.dumps(href) + ", {headers: "
+            "{'HX-Request': 'true', 'HX-Current-URL': location.href}, redirect: 'manual'});"
+            " return JSON.stringify({status: r.status, hx: r.headers.get('HX-Redirect')}); })()",
+            await_promise=True, return_by_value=True,
+        )
+        result = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        if not result.get("hx"):
+            raise RuntimeError(
+                f"bzzhr.to didn't return a download link (HTTP {result.get('status')}). "
+                "The link may have expired or the file is unavailable.")
+        return urllib.parse.urljoin(link, result["hx"])
+
     async def _resolve_direct_link_async(self, link, notify=None):
         async with self._browser_lock:
             self._notify, self._revealed = notify, False
@@ -531,6 +619,8 @@ class TurnstileSolver:
             try:
                 if "datanodes.to" in link.lower():
                     direct_url = await self._resolve_datanodes_async(link, tab)
+                elif "bzzhr.to" in link.lower():
+                    direct_url = await self._resolve_bzzhr_async(link, tab)
                 else:
                     direct_url = await self._resolve_fuckingfast_async(link, tab)
             finally:

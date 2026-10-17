@@ -454,7 +454,8 @@ import scheduler as offpeak
 from ui_style import button_style
 from providers import (
     needs_resolution, needs_form_resolution, resolve_form_link, ResolveError,
-    filename_from_link, RESOLVER_HOSTS,
+    filename_from_link, RESOLVER_HOSTS, download_resolved_directly,
+    filename_from_content_disposition,
 )
 from extraction import list_archive, is_extracted, run_with_progress, ExtractionCancelled
 from segmented import SegmentedDownload, probe as probe_ranges, state_path as segment_state_path, MIN_SEGMENT
@@ -1001,7 +1002,8 @@ class DownloadTask:
             "progress": self.progress,
             "is_update": self.is_update,
             "update_version": self.update_version,
-            "install_handled": self.install_handled
+            "install_handled": self.install_handled,
+            "filename": self.filename
         }
         
     @classmethod
@@ -1025,6 +1027,10 @@ class DownloadTask:
         task.is_update = data.get("is_update", False)
         task.update_version = data.get("update_version")
         task.install_handled = data.get("install_handled", False)
+        # A name taken from the server (links like bzzhr.to/<id> carry none).
+        if data.get("filename") and data["filename"] != task.filename:
+            task.filename = data["filename"]
+            task.filepath = os.path.normpath(os.path.join(task.save_dir, task.filename))
         return task
 
 def get_history_path():
@@ -1235,7 +1241,7 @@ class MainWindow(QMainWindow):
         left_layout.addLayout(left_header)
 
         self.text_links = QTextEdit()
-        self.text_links.setPlaceholderText("Paste FuckingFast / DataNodes / FileKeeper links or any direct download URLs here...")
+        self.text_links.setPlaceholderText("Paste FuckingFast / DataNodes / FileKeeper / BZZHR links or any direct download URLs here...")
         self.text_links.setAcceptRichText(False)
         self.text_links.setFixedHeight(77)
         self.text_links.installEventFilter(self)
@@ -1669,7 +1675,7 @@ class MainWindow(QMainWindow):
             "<h4>Changelog (v1.6.0 - Short):</h4>"
             "<ul>"
             "<li><b>New:</b> Multi-connection downloads for direct links (Settings → Connections per Download).</li>"
-            "<li><b>New:</b> FileKeeper (<code>filekeeper.net</code>) links are supported.</li>"
+            "<li><b>New:</b> FileKeeper (<code>filekeeper.net</code>) and BZZHR (<code>bzzhr.to</code>) links are supported.</li>"
             "<li><b>New:</b> Extraction progress bar, cancellable extraction, and a confirmation before re-extracting.</li>"
             "<li><b>New:</b> Auto-extract skips archives that are already extracted.</li>"
             "<li><b>New:</b> Any direct download link can be queued, not just FuckingFast/DataNodes.</li>"
@@ -2565,6 +2571,8 @@ class MainWindow(QMainWindow):
             elif task.status in ("Completed", "Extracted", "Extracting..."):
                 eta_str = "-"
             
+            if task.tree_item.text(0) != task.filename:
+                task.tree_item.setText(0, task.filename)
             task.tree_item.setText(2, task.status)
             # Apply word wrap to the tooltip text to avoid very long horizontal lines
             if "Error" in task.status and task.error_message:
@@ -3038,6 +3046,7 @@ class MainWindow(QMainWindow):
 
         url = url or task.link
         headers = {"User-Agent": f"SilverSpoon/{CURRENT_VERSION}"}
+        self._adopt_server_filename(task, url, headers)
         if self._download_segmented(task, url, headers):
             return
 
@@ -3107,6 +3116,25 @@ class MainWindow(QMainWindow):
             self._update_download_failed(task, he)
         except Exception as e:
             self._update_download_failed(task, e)
+
+    def _adopt_server_filename(self, task, url, headers):
+        """Links like bzzhr.to/<id> carry no file name, so the task would be
+        named after the id with no extension. Before anything is written, take
+        the name the server sends (Content-Disposition) instead."""
+        if os.path.splitext(task.filename)[1] or os.path.exists(task.filepath) \
+                or os.path.exists(segment_state_path(task.filepath)):
+            return
+        try:
+            req = urllib.request.Request(url, headers={**headers, "Range": "bytes=0-0"})
+            with contextlib.closing(urllib.request.urlopen(req, timeout=30)) as r:
+                name = filename_from_content_disposition(r.headers.get("Content-Disposition"))
+        except Exception as e:
+            logging.warning("Could not read the server file name for %s: %s", task.link, e)
+            return
+        if name and name != task.filename:
+            task.filename = name
+            task.filepath = os.path.normpath(os.path.join(task.save_dir, name))
+            self.trigger_history_save()
 
     def _download_segmented(self, task, url, headers):
         """Download over several connections when the server supports ranges.
@@ -3260,6 +3288,12 @@ class MainWindow(QMainWindow):
             
         if task.pause_flag:
             task.status = "Paused"
+            return
+
+        if download_resolved_directly(task.link):
+            # bzzhr.to: the resolved link needs no browser cookies, so use the
+            # direct downloader (resume, multiple connections, server file name).
+            self._download_direct_file(task, dl_url)
             return
 
         task.status = "Downloading"

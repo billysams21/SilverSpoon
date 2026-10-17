@@ -15,7 +15,11 @@ import urllib.request
 
 # Hosts handled by the Turnstile/CAPTCHA solver (cf_turnstile). Keep in sync
 # with the providers cf_turnstile.py actually supports.
-RESOLVER_HOSTS = ("fuckingfast.co", "datanodes.to")
+RESOLVER_HOSTS = ("fuckingfast.co", "datanodes.to", "bzzhr.to")
+
+# Solver hosts whose resolved link works without the browser's cookies, so the
+# file goes through the direct downloader (resume, multiple connections).
+DIRECT_AFTER_SOLVE_HOSTS = ("bzzhr.to",)
 
 # Hosts whose download page is a countdown followed by a form post
 # (op=download2) that redirects to the file. No browser needed.
@@ -44,6 +48,30 @@ def _host_matches(link, hosts):
 def needs_resolution(link):
     """True if the link's host must go through the Turnstile/CAPTCHA solver."""
     return _host_matches(link, RESOLVER_HOSTS)
+
+
+def download_resolved_directly(link):
+    """True if the solver's resolved link can be fetched by the direct downloader."""
+    return _host_matches(link, DIRECT_AFTER_SOLVE_HOSTS)
+
+
+def filename_from_content_disposition(value):
+    """File name from a Content-Disposition header (RFC 6266/5987), or None."""
+    if not value:
+        return None
+    m = re.search(r"filename\*\s*=\s*([\w-]+)'[^']*'([^;]+)", value, re.IGNORECASE)
+    if m:
+        try:
+            raw = urllib.parse.unquote(m.group(2).strip().strip('"'), encoding=m.group(1))
+        except LookupError:
+            raw = urllib.parse.unquote(m.group(2).strip().strip('"'))
+    else:
+        m = re.search(r'filename\s*=\s*"([^"]*)"|filename\s*=\s*([^;]+)', value, re.IGNORECASE)
+        if not m:
+            return None
+        raw = (m.group(1) if m.group(1) is not None else m.group(2)).strip()
+    name = _INVALID_FILENAME_CHARS.sub("_", raw.replace("\\", "/").split("/")[-1]).strip(" .")
+    return name or None
 
 
 def needs_form_resolution(link):

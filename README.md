@@ -1,6 +1,6 @@
 # SilverSpoon (previously FitGirlDownloader)
 
-> **Note:** `fuckingfast.co` and `datanodes.to` links (commonly used by FitGirl Repacks and direct download mirrors) go through the built-in Cloudflare Turnstile solver, and `filekeeper.net` links are resolved automatically (no browser needed). Since v1.6.0 any other plain `http(s)` direct link is downloaded straight away, with the same pause/resume/progress support.
+> **Note:** `fuckingfast.co` and `datanodes.to` links (commonly used by FitGirl Repacks and direct download mirrors) go through the built-in Cloudflare Turnstile solver, `bzzhr.to` links go through the same solver for the site's Cloudflare check, and `filekeeper.net` links are resolved automatically (no browser needed). Since v1.6.0 any other plain `http(s)` direct link is downloaded straight away, with the same pause/resume/progress support.
 
 A Python-based bulk downloader designed to bypass Cloudflare protections on file-hosting sites like *fuckingfast.co* and *datanodes.to*, and to queue ordinary direct download links alongside them. It automates the process of extracting direct download links and supports concurrent downloading with pause and resume capabilities.
 

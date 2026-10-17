@@ -287,7 +287,7 @@ class ModernTaskDelegate(QStyledItemDelegate):
             if status_text:
                 is_error = "Error" in status_text or status_text == "Contains Errors" or status_text == "CAPTCHA Timeout"
                 is_done = status_text in ("Completed", "Extracted")
-                is_active = status_text in ("Downloading", "Active", "Extracting...", "Solving CAPTCHA...", "Starting...")
+                is_active = status_text in ("Downloading", "Active", "Extracting...", "Solving CAPTCHA...", "Waiting for you to solve CAPTCHA", "Starting...")
                 is_paused = status_text in ("Paused", "Pausing...", "Cancelled", "Extract Cancelled")
 
                 # Detect if the app is currently running in dark or light mode based on window palette
@@ -484,6 +484,7 @@ def load_settings():
         "extract_after_download": False,
         "auto_retry_errors": False,
         "captcha_timeout": 10,
+        "show_solver_browser": False,
         "column_widths": {},
         "skip_delete_confirmation": False,
         "show_warning_dialog": True,
@@ -602,7 +603,7 @@ class WarningDialog(QDialog):
         
         tips_box = QLabel(
             "• <b>Slow Speeds:</b> If your download speed is too slow, try changing your DNS (e.g., Cloudflare 1.1.1.1 or Google 8.8.8.8) or enabling a VPN.<br>"
-            "• <b>CAPTCHA:</b> If a CAPTCHA prompt or browser window appears, please complete and solve it to allow downloads to proceed."
+            "• <b>CAPTCHA:</b> Cloudflare checks are solved automatically in the background. If a browser window pops up asking you to verify you're human, complete it and the download will continue."
         )
         tips_box.setTextFormat(Qt.TextFormat.RichText)
         tips_box.setWordWrap(True)
@@ -679,6 +680,14 @@ class SettingsDialog(QDialog):
         self.captcha_spinbox.setSuffix(" seconds")
         self.captcha_spinbox.setValue(self.current_settings.get("captcha_timeout", 10))
         layout.addRow("CAPTCHA Solve Timeout:", self.captcha_spinbox)
+
+        # The CAPTCHA browser runs off-screen unless asked to show it
+        self.show_solver_checkbox = QCheckBox()
+        self.show_solver_checkbox.setChecked(self.current_settings.get("show_solver_browser", False))
+        self.show_solver_checkbox.setToolTip(
+            "Show the browser window that solves Cloudflare checks for FuckingFast and "
+            "DataNodes. Off: it runs off-screen. Applies the next time it starts.")
+        layout.addRow("Show the CAPTCHA browser window:", self.show_solver_checkbox)
         
         # Extract Option
         self.extract_checkbox = QCheckBox()
@@ -726,6 +735,7 @@ class SettingsDialog(QDialog):
             self.connections_spinbox.setValue(4)
             self.bandwidth_spinbox.setValue(0)
             self.captcha_spinbox.setValue(10)
+            self.show_solver_checkbox.setChecked(False)
             self.extract_checkbox.setChecked(False)
             self.auto_retry_checkbox.setChecked(False)
             self.skip_delete_checkbox.setChecked(False)
@@ -742,6 +752,7 @@ class SettingsDialog(QDialog):
             "max_connections": self.connections_spinbox.value(),
             "bandwidth_limit": self.bandwidth_spinbox.value(),
             "captcha_timeout": self.captcha_spinbox.value(),
+            "show_solver_browser": self.show_solver_checkbox.isChecked(),
             "extract_after_download": self.extract_checkbox.isChecked(),
             "auto_retry_errors": self.auto_retry_checkbox.isChecked(),
             "skip_delete_confirmation": self.skip_delete_checkbox.isChecked(),
@@ -997,7 +1008,7 @@ class DownloadTask:
     def from_dict(cls, data):
         task = cls(data["link"], data["base_save_dir"], data["folder_name"])
         # Ensure it doesn't auto-start if it was active when closed
-        if data["status"] in ("Downloading", "Pending", "Starting...", "Resolving Container...", "Pausing...", "Solving CAPTCHA..."):
+        if data["status"] in ("Downloading", "Pending", "Starting...", "Resolving Container...", "Pausing...", "Solving CAPTCHA...", "Waiting for you to solve CAPTCHA"):
             task.status = "Paused"
             task.pause_flag = True
         else:
@@ -1064,7 +1075,8 @@ class MainWindow(QMainWindow):
         self.tasks = []
         self.max_workers = self.settings.get("max_workers", 3)
         captcha_timeout = self.settings.get("captcha_timeout", 10)
-        self.turnstile_solver = TurnstileSolver(timeout=captcha_timeout)
+        self.turnstile_solver = TurnstileSolver(
+            timeout=captcha_timeout, show_window=self.settings.get("show_solver_browser", False))
         self.dl_session = curl_requests.Session(impersonate="chrome")
         self.is_all_selected = False
         self.extracted_folders = set()
@@ -1972,6 +1984,7 @@ class MainWindow(QMainWindow):
             self.max_workers = self.settings.get("max_workers", 3)
             new_timeout = self.settings.get("captcha_timeout", 10)
             self.turnstile_solver.TOKEN_TIMEOUT = new_timeout
+            self.turnstile_solver.show_window = self.settings.get("show_solver_browser", False)
             default_dir = self.settings.get("default_save_dir", os.path.join(os.path.expanduser("~"), "Downloads"))
             self.dir_input.setText(default_dir)
             self.extract_checkbox.setChecked(self.settings.get("extract_after_download", False))
@@ -2333,7 +2346,7 @@ class MainWindow(QMainWindow):
 
     def start_downloads(self):
         for task in self.get_selected_tasks():
-            if task.status in ("Queued", "Cancelled", "Error", "Paused", "Pausing...", "CAPTCHA Timeout", "Solving CAPTCHA..."):
+            if task.status in ("Queued", "Cancelled", "Error", "Paused", "Pausing...", "CAPTCHA Timeout", "Solving CAPTCHA...", "Waiting for you to solve CAPTCHA"):
                 task.status = "Pending"
                 task.error_message = ""
                 task.cancel_flag = False
@@ -2558,6 +2571,9 @@ class MainWindow(QMainWindow):
                 import textwrap
                 wrapped_text = "\n".join(textwrap.wrap(task.error_message, width=60))
                 task.tree_item.setToolTip(2, wrapped_text)
+            elif task.status == "Waiting for you to solve CAPTCHA":
+                task.tree_item.setToolTip(
+                    2, "Complete the \"Verify you are human\" check in the browser window that opened.")
             else:
                 task.tree_item.setToolTip(2, "")
             task.tree_item.setText(3, prog_str)
@@ -2575,7 +2591,7 @@ class MainWindow(QMainWindow):
             task.tree_item.setData(1, Qt.ItemDataRole.UserRole, task.status)
                 
         # Update telemetry stat counters
-        active_count = sum(1 for t in self.tasks if t.status in ("Downloading", "Starting...", "Solving CAPTCHA...", "Extracting..."))
+        active_count = sum(1 for t in self.tasks if t.status in ("Downloading", "Starting...", "Solving CAPTCHA...", "Waiting for you to solve CAPTCHA", "Extracting..."))
         queued_count = sum(1 for t in self.tasks if t.status in ("Queued", "Pending"))
         done_count = sum(1 for t in self.tasks if t.status in ("Completed", "Extracted", "Extract Cancelled"))
         self.stat_active_val.setText(str(active_count))
@@ -2698,7 +2714,7 @@ class MainWindow(QMainWindow):
             # and the manager can exceed the configured concurrency limit.
             active = sum(
                 1 for t in self.tasks
-                if t.status in ("Downloading", "Starting...", "Solving CAPTCHA...")
+                if t.status in ("Downloading", "Starting...", "Solving CAPTCHA...", "Waiting for you to solve CAPTCHA")
             )
             if active < self.max_workers:
                 for task in self.tasks:
@@ -2977,7 +2993,12 @@ class MainWindow(QMainWindow):
     def get_direct_link(self, task):
         try:
             task.status = "Solving CAPTCHA..."
-            result = self.turnstile_solver.get_direct_link(task.link)
+
+            def notify(waiting):
+                # The solver shows its window when a check needs a human click.
+                task.status = "Waiting for you to solve CAPTCHA" if waiting else "Solving CAPTCHA..."
+
+            result = self.turnstile_solver.get_direct_link(task.link, notify=notify)
             direct_link = result.get("direct_url")
             if direct_link:
                 # Stash cookies/UA on the task for the download transport

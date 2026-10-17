@@ -73,9 +73,18 @@ def find_browsers():
 
 class TurnstileSolver:
     MAX_ATTEMPTS = 2
+    # Extra time the user gets once the window is shown for a check that
+    # didn't pass on its own (an interactive "Verify you are human").
+    USER_SOLVE_TIME = 90
 
-    def __init__(self, profile_dir=None, timeout=10):
+    def __init__(self, profile_dir=None, timeout=10, show_window=False):
         self.TOKEN_TIMEOUT = timeout
+        # Off-screen by default. Not minimized: Chrome treats a minimized page
+        # as hidden and stops rendering it, which Turnstile can stall on. Takes
+        # effect the next time the browser starts.
+        self.show_window = show_window
+        self._notify = None      # per resolution: notify(waiting_for_user: bool)
+        self._revealed = False   # window currently shown for the user
         self._profile_dir = profile_dir or os.path.join(
             tempfile.gettempdir(), "silverspoon_browser_profile"
         )
@@ -161,7 +170,13 @@ class TurnstileSolver:
                         "--no-default-browser-check",
                         "--disable-restore-session-state",
                         "--window-size=500,550",
-                        "--window-position=50,50",
+                        "--window-position=50,50" if self.show_window
+                        else "--window-position=-32000,-32000",
+                        # Keep timers and rendering at full speed while the
+                        # window is off-screen or covered by other windows.
+                        "--disable-backgrounding-occluded-windows",
+                        "--disable-renderer-backgrounding",
+                        "--disable-background-timer-throttling",
                     ],
                 )
                 self._tab = await self._browser.get("about:blank")
@@ -246,6 +261,35 @@ class TurnstileSolver:
         logger.info("TurnstileSolver: page loaded: %s", page_url)
         return tab
 
+    async def _ask_user(self, tab):
+        """Bring the (normally off-screen) window in front of the user so they
+        can complete a check that didn't pass on its own."""
+        if self._revealed:
+            return
+        self._revealed = True
+        logger.warning("TurnstileSolver: check didn't pass on its own; showing the window for the user")
+        try:
+            if not self.show_window:
+                await tab.set_window_state(left=50, top=50, width=500, height=550, state="normal")
+            await tab.bring_to_front()
+        except Exception as e:
+            logger.warning("TurnstileSolver: could not show the window: %s", e)
+        if self._notify:
+            self._notify(True)
+
+    async def _user_done(self, tab):
+        """Send the window back off-screen once the check has passed."""
+        if not self._revealed:
+            return
+        self._revealed = False
+        try:
+            if not self.show_window:
+                await tab.set_window_state(left=-32000, top=-32000, width=500, height=550, state="normal")
+        except Exception as e:
+            logger.warning("TurnstileSolver: could not hide the window: %s", e)
+        if self._notify:
+            self._notify(False)
+
     async def _resolve_fuckingfast_async(self, link, tab):
         file_id = link.split("/")[-1].split("#")[0]
         challenge_state = await tab.evaluate(
@@ -267,7 +311,11 @@ class TurnstileSolver:
 
         if has_widget and len(token) <= 20:
             for attempt in range(self.MAX_ATTEMPTS):
-                for i in range(self.TOKEN_TIMEOUT):
+                last = attempt == self.MAX_ATTEMPTS - 1
+                # The last attempt runs with the window shown, so it also gets
+                # time for the user to click an interactive check.
+                wait = self.TOKEN_TIMEOUT + (self.USER_SOLVE_TIME if last else 0)
+                for i in range(wait):
                     if self._stop_requested:
                         raise RuntimeError("Solver stopped while waiting for token.")
                     try:
@@ -294,17 +342,20 @@ class TurnstileSolver:
                 if isinstance(token, str) and len(token) > 20:
                     break
                     
-                if attempt < self.MAX_ATTEMPTS - 1:
-                    logger.warning("TurnstileSolver (FuckingFast): no token yet; recreating tab and retrying navigation")
+                if not last:
+                    logger.warning("TurnstileSolver (FuckingFast): no token yet; reloading with the window shown")
                     self._tab = None
                     tab = await self._navigate(link)
+                    await self._ask_user(tab)
                     await asyncio.sleep(3)
 
             if not isinstance(token, str) or len(token) <= 20:
+                waited = self.TOKEN_TIMEOUT * self.MAX_ATTEMPTS + self.USER_SOLVE_TIME
                 raise RuntimeError(
-                    f"Cloudflare Turnstile did not produce a token after {self.TOKEN_TIMEOUT} seconds. "
-                    "Your IP may be flagged or the site may require an interactive challenge."
+                    f"Cloudflare Turnstile was not completed after {waited} seconds. "
+                    "Your IP may be flagged, or the check in the browser window wasn't completed."
                 )
+            await self._user_done(tab)
 
         fetch_js = (
             "(async()=>{const r=await fetch('/f/" + file_id + "/go',"
@@ -409,9 +460,13 @@ class TurnstileSolver:
         await tab.send(cdp.network.enable())
 
         logger.info("TurnstileSolver (DataNodes): working through download steps...")
-        # Step 1 animation (~10 s) + Turnstile + countdown (~10 s) + POST.
-        captcha_timeout = max(30, self.TOKEN_TIMEOUT + 15)
-        deadline = asyncio.get_running_loop().time() + captcha_timeout + 45
+        # Turnstile gets reveal_after seconds to pass on its own, then the window
+        # is shown and the user gets USER_SOLVE_TIME more to complete it.
+        reveal_after = max(10, self.TOKEN_TIMEOUT)
+        captcha_timeout = reveal_after + self.USER_SOLVE_TIME
+        # Step 1 animation (~10 s) + Turnstile + countdown (~10 s) + POST;
+        # extended below if the user is asked to solve the check.
+        deadline = asyncio.get_running_loop().time() + max(30, self.TOKEN_TIMEOUT + 15) + 45
         captcha_since = None
         state = {}
         while not direct_url:
@@ -437,13 +492,17 @@ class TurnstileSolver:
             # Turnstile showing with no download button yet means it hasn't passed.
             if state.get("hasCaptcha") and not (state.get("clicked") or state.get("waiting")):
                 captcha_since = captcha_since or now
+                if now - captcha_since > reveal_after and not self._revealed:
+                    await self._ask_user(tab)
+                    deadline += self.USER_SOLVE_TIME
                 if now - captcha_since > captcha_timeout:
                     raise RuntimeError(
-                        f"DataNodes Turnstile did not pass after {captcha_timeout} seconds. "
-                        "Your IP may be flagged or the site may require an interactive challenge."
+                        f"DataNodes Turnstile was not completed after {captcha_timeout} seconds. "
+                        "Your IP may be flagged, or the check in the browser window wasn't completed."
                     )
             else:
                 captcha_since = None
+                await self._user_done(tab)  # passed (no-op if it was never shown)
 
         if not direct_url:
             raise RuntimeError(
@@ -454,8 +513,9 @@ class TurnstileSolver:
 
         return direct_url
 
-    async def _resolve_direct_link_async(self, link):
+    async def _resolve_direct_link_async(self, link, notify=None):
         async with self._browser_lock:
+            self._notify, self._revealed = notify, False
             await self._ensure_browser()
             try:
                 logger.info("TurnstileSolver: resolving %s", link)
@@ -468,10 +528,16 @@ class TurnstileSolver:
 
             await asyncio.sleep(2)
 
-            if "datanodes.to" in link.lower():
-                direct_url = await self._resolve_datanodes_async(link, tab)
-            else:
-                direct_url = await self._resolve_fuckingfast_async(link, tab)
+            try:
+                if "datanodes.to" in link.lower():
+                    direct_url = await self._resolve_datanodes_async(link, tab)
+                else:
+                    direct_url = await self._resolve_fuckingfast_async(link, tab)
+            finally:
+                # Never leave the window on screen (a failure closes the browser).
+                if self._revealed and self._tab is not None:
+                    await self._user_done(self._tab)
+                self._notify, self._revealed = None, False
 
             ua_raw = await tab.evaluate("JSON.stringify(navigator.userAgent)", return_by_value=True)
             user_agent = json.loads(ua_raw) if isinstance(ua_raw, str) else str(ua_raw)
@@ -493,12 +559,14 @@ class TurnstileSolver:
                 
             return {"direct_url": direct_url, "cookies": cookies, "user_agent": user_agent}
 
-    def get_direct_link(self, link):
-        return self._submit(self._resolve_with_cleanup(link))
+    def get_direct_link(self, link, notify=None):
+        """notify(True) is called when the window is shown because the user
+        must complete the check, notify(False) once it's hidden again."""
+        return self._submit(self._resolve_with_cleanup(link, notify))
 
-    async def _resolve_with_cleanup(self, link):
+    async def _resolve_with_cleanup(self, link, notify=None):
         try:
-            return await self._resolve_direct_link_async(link)
+            return await self._resolve_direct_link_async(link, notify)
         except Exception:
             # Any failed resolution tears the browser down so a broken instance
             # is never reused — reuse was causing repeated browser re-spawns that

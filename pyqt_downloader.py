@@ -457,6 +457,8 @@ from providers import (
     filename_from_link, RESOLVER_HOSTS, download_resolved_directly,
     filename_from_content_disposition,
 )
+import dlc as dlc_mod
+import linkfiles
 from extraction import list_archive, is_extracted, run_with_progress, ExtractionCancelled
 from segmented import SegmentedDownload, probe as probe_ranges, state_path as segment_state_path, MIN_SEGMENT
 
@@ -1061,6 +1063,8 @@ class MainWindow(QMainWindow):
     # Emitted from the connectivity-probe thread once a window-open probe
     # succeeds; carries `now` and is handled on the GUI thread.
     _offpeak_open_ready = pyqtSignal(object)
+    # Emitted from the file-reading thread: ([(package, [urls])], [error text]).
+    _links_loaded = pyqtSignal(object, object)
 
     def __init__(self):
         super().__init__()
@@ -1113,6 +1117,8 @@ class MainWindow(QMainWindow):
         self.offpeak_session_uids = None
         self._offpeak_probing = False
         self._offpeak_open_ready.connect(self._do_offpeak_open)
+        self._links_loaded.connect(self._on_links_loaded)
+        self.setAcceptDrops(True)
         self.sched_timer = QTimer()
         self.sched_timer.timeout.connect(self.scheduler_tick)
         self.sched_timer.start(30_000)
@@ -1145,6 +1151,10 @@ class MainWindow(QMainWindow):
         import_action = QAction("&Import Links from File...", self)
         import_action.triggered.connect(self.import_links_from_file)
         file_menu.addAction(import_action)
+
+        import_dlc_action = QAction("Import &DLC Container...", self)
+        import_dlc_action.triggered.connect(self.import_dlc_from_file)
+        file_menu.addAction(import_dlc_action)
         
         settings_action = QAction("&Settings", self)
         settings_action.triggered.connect(self.open_settings_dialog)
@@ -1241,6 +1251,7 @@ class MainWindow(QMainWindow):
         left_layout.addLayout(left_header)
 
         self.text_links = QTextEdit()
+        self.text_links.setAcceptDrops(False)  # let file drops reach the window
         self.text_links.setPlaceholderText("Paste FuckingFast / DataNodes / FileKeeper / BZZHR links or any direct download URLs here...")
         self.text_links.setAcceptRichText(False)
         self.text_links.setFixedHeight(77)
@@ -1255,6 +1266,7 @@ class MainWindow(QMainWindow):
 
         default_dir = self.settings.get("default_save_dir", os.path.join(os.path.expanduser("~"), "Downloads"))
         self.dir_input = QLineEdit(default_dir)
+        self.dir_input.setAcceptDrops(False)
         dir_row.addWidget(self.dir_input)
 
         browse_btn = QPushButton("Browse")
@@ -1631,18 +1643,123 @@ class MainWindow(QMainWindow):
                 batch_item.setExpanded(True)
 
     def import_links_from_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Import Links", "", "Text Files (*.txt);;All Files (*)")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Import Links", "",
+            "Link Files (*.txt *.dlc *.html *.htm *.json *.csv *.url);;Text Files (*.txt);;"
+            "DLC Containers (*.dlc);;All Files (*)")
+        if not file_path:
+            return
+        if not file_path.lower().endswith(".txt"):
+            # DLC, HTML, anything else: detect the format and queue the links.
+            self.import_files([file_path])
+            return
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                current_text = self.text_links.toPlainText()
+                if current_text.strip():
+                    self.text_links.setText(current_text + "\n" + content)
+                else:
+                    self.text_links.setText(content)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to read file:\n{e}")
+
+    def import_dlc_from_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Import DLC Container", "", "DLC Containers (*.dlc);;All Files (*)")
         if file_path:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                    current_text = self.text_links.toPlainText()
-                    if current_text.strip():
-                        self.text_links.setText(current_text + "\n" + content)
-                    else:
-                        self.text_links.setText(content)
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to read file:\n{e}")
+            self.import_files([file_path])
+
+    def dragEnterEvent(self, event):
+        if any(os.path.isfile(u.toLocalFile()) for u in event.mimeData().urls()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        paths = [u.toLocalFile() for u in event.mimeData().urls()]
+        paths = [p for p in paths if os.path.isfile(p)]
+        if paths:
+            event.acceptProposedAction()
+            self.import_files(paths)
+
+    def import_files(self, paths):
+        """Read link files off the GUI thread (a DLC asks JDownloader's key
+        service over the network), then queue the links in _on_links_loaded."""
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        def worker():
+            packages, errors = [], []
+            for path in paths:
+                try:
+                    packages.extend(linkfiles.extract_from_file(path))
+                except linkfiles.LinkFileError as e:
+                    errors.append(str(e))
+                except Exception as e:
+                    logging.error("Link file import failed", exc_info=True)
+                    errors.append(f"{os.path.basename(path)}: {e}")
+            self._links_loaded.emit(packages, errors)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _suggest_folder_name(self, link):
+        """Folder name guessed from a download link's file name."""
+        try:
+            filename = filename_from_link(link) or ""
+        except Exception:
+            filename = ""
+        match = re.search(r'(.*?)(\.part\d+\.rar|\.rar)$', filename, re.IGNORECASE)
+        if match:
+            suggested = match.group(1).strip('._-')
+        else:
+            suggested = filename.rsplit('.', 1)[0]
+        return suggested.replace('_--_fitgirl-repacks.site', '').replace('_--_', ' ').replace('_', ' ').strip()
+
+    def _on_links_loaded(self, packages, errors):
+        QApplication.restoreOverrideCursor()
+        if not packages:
+            QMessageBox.warning(self, "Import Links", "\n".join(errors) or "No links found.")
+            return
+
+        save_dir = os.path.abspath(self.dir_input.text())
+        existing = {t.link for t in self.tasks}
+
+        def folder_for(name, urls):
+            return dlc_mod.safe_folder_name(
+                name or self._suggest_folder_name(urls[0]), "Imported Links")
+
+        # One package: let the user confirm/rename the folder, like Add to Queue.
+        # Several: each keeps its own (package or guessed) name, no prompts.
+        if len(packages) == 1:
+            name, urls = packages[0]
+            folder_name, ok = QInputDialog.getText(
+                self, "Batch Folder Name",
+                f"Found {len(urls)} link(s). Enter a folder name for these files:",
+                QLineEdit.EchoMode.Normal, folder_for(name, urls))
+            if not ok or not folder_name.strip():
+                return
+            packages = [(folder_name.strip(), urls)]
+
+        added = skipped = 0
+        for name, urls in packages:
+            folder_name = folder_for(name, urls)
+            for link in urls:
+                if not link.startswith("http") or link in existing:
+                    skipped += 1
+                    continue
+                existing.add(link)
+                self.add_task_to_ui(DownloadTask(link, save_dir, folder_name))
+                added += 1
+        msg = f"{added} link(s) added to the queue"
+        if skipped:
+            msg += f", {skipped} skipped (already queued)"
+        msg += "."
+        if errors:
+            msg += "\n\nCouldn't read:\n" + "\n".join(errors)
+        QMessageBox.information(self, "Import Links", msg)
 
     def open_github_link(self):
         QDesktopServices.openUrl(QUrl("https://github.com/billysams21/SilverSpoon"))
@@ -2233,17 +2350,7 @@ class MainWindow(QMainWindow):
             
         save_dir = os.path.abspath(self.dir_input.text())
         
-        # Try to guess a folder name from the first link
-        suggested_folder = ""
-        first_link = links[0]
-        first_filename = filename_from_link(first_link)
-        match = re.search(r'(.*?)(\.part\d+\.rar|\.rar)$', first_filename, re.IGNORECASE)
-        if match:
-            suggested_folder = match.group(1).strip('._-')
-        else:
-            suggested_folder = first_filename.rsplit('.', 1)[0]
-            
-        suggested_folder = suggested_folder.replace('_--_fitgirl-repacks.site', '').replace('_--_', ' ').replace('_', ' ').strip()
+        suggested_folder = self._suggest_folder_name(links[0])
 
         folder_name, ok = QInputDialog.getText(
             self, 

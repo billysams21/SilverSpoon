@@ -33,7 +33,7 @@ A Python bulk downloader for file hosts used by FitGirl Repacks, SteamRIP and si
 
 **Queue & Workflow**
 * **Grouped Batch Folders:** Downloads are grouped into collapsible batch folders with aggregated progress, speed and ETA. A folder name is suggested so main parts and optional files land together.
-* **Smart Clipboard & Import:** Paste text or rich HTML (e.g. a copied table) and SilverSpoon extracts the links, or import a `.txt` list.
+* **Smart Clipboard & Import:** Paste text or rich HTML (e.g. a copied table) and SilverSpoon extracts the links, import a `.txt` list, or drop any link file (JDownloader `.dlc`, `.txt`, `.html`, `.json`...) onto the window and SilverSpoon detects the format and queues the links (a DLC needs internet to fetch its decryption key).
 * **Download Scheduler:** Download automatically during an off-peak window (weekly or one-off), with optional Windows wake timers and sleep prevention.
 * **Persistent History & Settings:** Your queue, progress, folders and preferences survive restarts.
 * **Single Instance:** Only one copy runs at a time, so two windows can't corrupt the shared queue.
@@ -76,7 +76,7 @@ python pyqt_downloader.py
 2. Open the game page and pick a mirror (FuckingFast, DataNodes, FileKeeper, or BZZHR on SteamRIP). Plain direct links from any other host can be pasted as-is.
 ![FitGirl 1](assets/fitgirl1.png)
 3. Copy the links you want to download.
-4. Paste your links into the top text box (one per line) or use `File -> Import Links from File...`. You can also copy links or tables straight from your browser and click **Paste Clipboard**; SilverSpoon extracts the URLs from rich HTML clipboard data.
+4. Paste your links into the top text box (one per line) or use `File -> Import Links from File...` (or drag a `.dlc`, `.txt` or `.html` file straight onto the window). You can also copy links or tables straight from your browser and click **Paste Clipboard**; SilverSpoon extracts the URLs from rich HTML clipboard data.
 ![App Screenshot 2](assets/screenshot2.png)
 5. Click **Add to Queue** and confirm the batch folder name, so all main and optional files go to the same place.
 6. Click **Select All** (or tick individual boxes) for the files you want to download.

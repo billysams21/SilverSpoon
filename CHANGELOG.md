@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### New Features
+* **Drop Any Link File**: Drag one or more files onto the window and SilverSpoon works out the format from the file's contents, pulls out the links and adds them to the queue. Supports JDownloader `.dlc` containers (decrypted with a key fetched from JDownloader's DLC service, so it needs an internet connection) and any text-like file with links in it: `.txt`, `.html`, `.json`, `.csv`, `.url`. A DLC is recognised even if renamed. One package asks for the batch folder name (pre-filled); several files or packages each get their own folder. Duplicates already in the queue are skipped, and files that can't be read are listed in the summary. `File -> Import Links from File...` still works (`.txt` fills the text box as before; other files are queued directly) and `File -> Import DLC Container...` was added. Adds the `cryptography` dependency.
+
 ## [v1.6.0] - 2026-10-17
 
 ### New Features

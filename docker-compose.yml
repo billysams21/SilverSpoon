@@ -1,0 +1,17 @@
+services:
+  silverspoon:
+    build: .
+    image: silverspoon-web
+    container_name: silverspoon
+    restart: unless-stopped
+    ports:
+      - "8080:8080"   # web UI
+      - "6080:6080"   # CAPTCHA browser view (noVNC); the UI opens it when a check needs you
+    volumes:
+      - ./downloads:/downloads
+      - ./data:/data   # settings and queue history
+    environment:
+      PUID: ${PUID:-1000}   # match the owner of ./downloads and ./data (`id -u`)
+      PGID: ${PGID:-1000}   # (`id -g`)
+      TZ: ${TZ:-UTC}   # the download scheduler uses the container's local time
+    shm_size: 1gb      # Chromium needs more than Docker's 64 MB default

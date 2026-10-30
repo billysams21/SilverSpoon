@@ -112,6 +112,44 @@ For servers or automation:
    ```
 *(Files are downloaded to the current working directory. The CLI handles the browser-solved hosts: FuckingFast, DataNodes and BZZHR. FileKeeper, plain direct links, multi-connection downloads and extraction are GUI-only.)*
 
+## Run with Docker (web UI)
+
+The same downloader runs headless in a container with a browser UI, which suits a NAS or home server. Save this as `docker-compose.yml`:
+
+```yaml
+services:
+  silverspoon:
+    image: ghcr.io/billysams21/silverspoon:latest
+    container_name: silverspoon
+    restart: unless-stopped
+    ports:
+      - "8080:8080"   # web UI
+      - "6080:6080"   # CAPTCHA browser view (noVNC); the UI opens it when a check needs you
+    volumes:
+      - ./downloads:/downloads
+      - ./data:/data   # settings and queue history
+    environment:
+      PUID: 1000   # user and group the app runs as; set to the owner of the folders (`id -u` / `id -g`)
+      PGID: 1000
+      TZ: UTC      # the download scheduler uses this time zone, e.g. Europe/Amsterdam
+    shm_size: 1gb      # Chromium needs more than Docker's 64 MB default
+```
+
+Then start it. Docker creates the `downloads` and `data` folders next to the file:
+
+```bash
+docker compose up -d
+```
+
+To build the image from a checkout instead of pulling it, use the `docker-compose.yml` in the repository and run `docker compose up -d --build`.
+
+Open <http://localhost:8080>. Paste links, add them to the queue and manage them as in the desktop app (Auto-Extract, pause/resume, scheduler, settings).
+
+* `./downloads` holds the downloaded and extracted files; `./data` holds your settings and queue history. `PUID`/`PGID` (default 1000, as in linuxserver.io images) set the user the app runs as and should match the owner of both folders; the container fixes ownership of `./data` on start. `PUID=0` runs it as root (`PUID=0 PGID=0` is full root). `TZ` sets the time zone the download scheduler uses.
+* **CAPTCHAs:** the solver's Chromium runs on a virtual display inside the container. When a check needs a click, the page shows a **Solve now** banner that opens the browser view (noVNC, port 6080). You can also open `http://localhost:6080/vnc.html` yourself.
+* The web UI has **no login**, and neither does the browser view on port 6080. Keep both ports on a trusted network or put an authenticating reverse proxy in front of them. Do not expose them to the internet.
+* The auto-updater, Windows wake timer and "Open Folder" are desktop-only and not part of the web UI.
+
 ## Building the Windows executable
 
 Run `build_exe.bat` (needs `pyinstaller` and a Playwright Chromium under `%LOCALAPPDATA%\ms-playwright`); the distributable folder lands in `dist\SilverSpoon`. Pushing a `v*.*.*` tag runs the same build on GitHub Actions and attaches `SilverSpoon-windows.zip` to the release.

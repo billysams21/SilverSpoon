@@ -13,6 +13,8 @@ jobs:
       # test_extraction.py needs a Linux 7-Zip (the repo's 7z.exe is Windows-only).
       - name: Install 7-Zip
         run: command -v 7z || (sudo apt-get update && sudo apt-get install -y 7zip)
+      - name: Install Python dependencies
+        run: pip install -r requirements-web.txt
       - name: Compile all
         run: python -m compileall -q .
       - name: Run headless tests
@@ -23,3 +25,10 @@ jobs:
             echo "== $t =="
             python "$t" || exit 1
           done
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the web image
+        run: docker build -t silverspoon-web .

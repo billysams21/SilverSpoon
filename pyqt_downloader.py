@@ -2,19 +2,12 @@ import sys
 import os
 import time
 import threading
-import re
 import subprocess
-import json
 import logging
 import logging.handlers
 import tempfile
-import contextlib
 import zipfile
-import shutil
-import uuid
 import urllib.request
-import urllib.error
-import urllib.parse
 from collections import deque
 
 LOG_PATH = os.path.expanduser("~/.silverspoon.log")
@@ -445,72 +438,16 @@ class ModernTaskDelegate(QStyledItemDelegate):
 
 ProgressBarDelegate = ModernTaskDelegate
 
-from curl_cffi import requests as curl_requests
-from cf_turnstile import TurnstileSolver
-from PyQt6.QtCore import QMetaObject, Q_ARG
 from update_logic import UpdateCheckerThread
 import datetime as _dt
 import scheduler as offpeak
 from ui_style import button_style
-from providers import (
-    needs_resolution, needs_form_resolution, resolve_form_link, ResolveError,
-    filename_from_link, RESOLVER_HOSTS, download_resolved_directly,
-    filename_from_content_disposition,
+from engine import (
+    DownloadEngine, DownloadTask, CURRENT_VERSION, load_settings, save_settings,
+    get_settings_path, parse_links, suggest_folder,
 )
-from extraction import list_archive, is_extracted, run_with_progress, ExtractionCancelled
-from segmented import SegmentedDownload, probe as probe_ranges, state_path as segment_state_path, MIN_SEGMENT
 
-CURRENT_VERSION = "v1.6.0"
 GITHUB_REPO = "billysams21/SilverSpoon"
-
-def get_settings_path():
-    return os.path.expanduser("~/.silverspoon_settings.json")
-
-def load_settings():
-    if sys.platform == "win32":
-        default_downloads = os.path.join(os.path.expanduser("~"), "Downloads")
-        if not os.path.exists(default_downloads):
-            try:
-                os.makedirs(default_downloads, exist_ok=True)
-            except Exception:
-                default_downloads = os.path.abspath(".")
-    else:
-        default_downloads = os.path.abspath(".")
-        
-    default_settings = {
-        "theme": "Dark",
-        "default_save_dir": default_downloads,
-        "max_workers": 3,
-        "max_connections": 4,
-        "extract_after_download": False,
-        "auto_retry_errors": False,
-        "captcha_timeout": 10,
-        "show_solver_browser": False,
-        "column_widths": {},
-        "skip_delete_confirmation": False,
-        "show_warning_dialog": True,
-        "last_update_check": 0.0
-    }
-    settings_path = get_settings_path()
-    if os.path.exists(settings_path):
-        try:
-            with open(settings_path, 'r', encoding='utf-8') as f:
-                loaded = json.load(f)
-                default_settings.update(loaded)
-        except Exception:
-            pass
-
-    save_settings(default_settings)
-    
-    return default_settings
-
-def save_settings(settings):
-    settings_path = get_settings_path()
-    try:
-        with open(settings_path, 'w', encoding='utf-8') as f:
-            json.dump(settings, f, indent=4)
-    except Exception as e:
-        logging.error("Failed to save settings: %s", e)
 
 def apply_theme(app, theme_name):
     if theme_name == "Dark":
@@ -549,27 +486,6 @@ def apply_theme(app, theme_name):
         light_palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
         app.setPalette(light_palette)
         app.setStyleSheet(LIGHT_THEME_QSS)
-
-def format_error_message(error, max_length=160):
-    text = str(error).strip()
-    lower_text = text.lower()
-    error_type = type(error).__name__
-
-    if "connectionabortederror" in lower_text or "10053" in text:
-        return "Connection was aborted by your computer or network security software. Try again, or check firewall/antivirus settings."
-    if "connection reset" in lower_text or "connectionreseterror" in lower_text:
-        return "Connection was reset by the server or your network. Try again later."
-    if "timed out" in lower_text or "timeout" in lower_text:
-        return "The connection timed out. Check your network and try again."
-
-    if not text:
-        return error_type
-
-    text = re.sub(r"\s+", " ", text)
-    if len(text) > max_length:
-        text = text[:max_length].rstrip() + "..."
-    return f"{error_type}: {text}"
-
 
 class WarningDialog(QDialog):
     def __init__(self, settings, parent=None):
@@ -939,124 +855,6 @@ class DownloadSchedulerDialog(QDialog):
             "keep_awake": self.keep_awake_cb.isChecked(),
         }
 
-class DownloadTask:
-    def __init__(self, link, base_save_dir, folder_name=None):
-        self.link = link.strip()
-        self.base_save_dir = base_save_dir
-
-        self.filename = filename_from_link(self.link)
-        self.file_id = self.link.rstrip('/').split('/')[-1].split('#')[0]
-        
-        if folder_name:
-            self.folder_name = folder_name
-        else:
-            # Fallback calculate smart directory grouping based on prefix
-            match = re.search(r'(.*?)(\.part\d+\.rar|\.rar)$', self.filename, re.IGNORECASE)
-            if match:
-                self.folder_name = match.group(1).strip('._-')
-            else:
-                self.folder_name = self.filename.rsplit('.', 1)[0]
-            
-        self.save_dir = os.path.normpath(os.path.join(self.base_save_dir, self.folder_name))
-        self.filepath = os.path.normpath(os.path.join(self.save_dir, self.filename))
-        
-        # Stable per-instance id: survives restart (persisted) and uniquely
-        # identifies this task even when two tasks share the same link.
-        self.uid = uuid.uuid4().hex
-        self.status = "Queued"
-        self.progress = 0.0
-        self.speed = 0.0
-        self.downloaded_bytes = 0
-        self.total_bytes = 0
-        self.error_message = ""
-        self.retry_count = 0
-        
-        self.pause_flag = False
-        self.cancel_flag = False
-        self.tree_item = None
-        self.is_selected = False
-
-        # App-update tasks download a plain URL (no CAPTCHA/direct-link step)
-        # and, once complete, offer to install instead of being extracted.
-        self.is_update = False
-        self.update_version = None
-        # Set once the install prompt has been answered (incl. "Not yet") so it
-        # isn't shown again on every launch; installing later goes through the
-        # task's "Install Update" menu item.
-        self.install_handled = False
-
-        # Extraction progress (0-100) while status is "Extracting...", or None
-        # when the extractor doesn't report one. Not persisted.
-        self.extract_progress = None
-
-    def to_dict(self):
-        return {
-            "uid": self.uid,
-            "link": self.link,
-            "base_save_dir": self.base_save_dir,
-            "folder_name": self.folder_name,
-            "status": self.status,
-            "error_message": self.error_message,
-            "downloaded_bytes": self.downloaded_bytes,
-            "total_bytes": self.total_bytes,
-            "progress": self.progress,
-            "is_update": self.is_update,
-            "update_version": self.update_version,
-            "install_handled": self.install_handled,
-            "filename": self.filename
-        }
-        
-    @classmethod
-    def from_dict(cls, data):
-        task = cls(data["link"], data["base_save_dir"], data["folder_name"])
-        # Ensure it doesn't auto-start if it was active when closed
-        if data["status"] in ("Downloading", "Pending", "Starting...", "Resolving Container...", "Pausing...", "Solving CAPTCHA...", "Waiting for you to solve CAPTCHA"):
-            task.status = "Paused"
-            task.pause_flag = True
-        else:
-            task.status = data["status"]
-            
-        # Keep the persisted uid so scheduled targets survive a restart; older
-        # history without one keeps the freshly generated uid.
-        if data.get("uid"):
-            task.uid = data["uid"]
-        task.downloaded_bytes = data.get("downloaded_bytes", 0)
-        task.total_bytes = data.get("total_bytes", 0)
-        task.progress = data.get("progress", 0.0)
-        task.error_message = data.get("error_message", "")
-        task.is_update = data.get("is_update", False)
-        task.update_version = data.get("update_version")
-        task.install_handled = data.get("install_handled", False)
-        # A name taken from the server (links like bzzhr.to/<id> carry none).
-        if data.get("filename") and data["filename"] != task.filename:
-            task.filename = data["filename"]
-            task.filepath = os.path.normpath(os.path.join(task.save_dir, task.filename))
-        return task
-
-def get_history_path():
-    return os.path.expanduser("~/.silverspoon_history.json")
-
-def load_history():
-    history_path = get_history_path()
-    tasks = []
-    if os.path.exists(history_path):
-        try:
-            with open(history_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                for item_data in data:
-                    tasks.append(DownloadTask.from_dict(item_data))
-        except Exception:
-            pass
-    return tasks
-
-def save_history(tasks):
-    history_path = get_history_path()
-    try:
-        with open(history_path, 'w', encoding='utf-8') as f:
-            json.dump([t.to_dict() for t in tasks], f, indent=4)
-    except Exception as e:
-        logging.error("Failed to save history: %s", e)
-
 class MainWindow(QMainWindow):
     # Emitted from the connectivity-probe thread once a window-open probe
     # succeeds; carries `now` and is handled on the GUI thread.
@@ -1076,20 +874,16 @@ class MainWindow(QMainWindow):
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
         
-        self.settings = load_settings()
-        
-        self.tasks = []
-        self.max_workers = self.settings.get("max_workers", 3)
-        captcha_timeout = self.settings.get("captcha_timeout", 10)
-        self.turnstile_solver = TurnstileSolver(
-            timeout=captcha_timeout, show_window=self.settings.get("show_solver_browser", False))
-        self.dl_session = curl_requests.Session(impersonate="chrome")
+        self.engine = DownloadEngine(autostart=False)
+        # The window reads the engine's live queue and settings directly.
+        self.settings = self.engine.settings
+        self.tasks = self.engine.tasks
         self.is_all_selected = False
-        self.extracted_folders = set()
-        
+        self._last_event_id = 0
+
         self.setup_ui()
         self.load_tasks_from_history()
-        
+
         if self.settings.get("show_warning_dialog", True):
             QTimer.singleShot(100, self.show_warning_dialog)
 
@@ -1099,26 +893,9 @@ class MainWindow(QMainWindow):
             self.update_checker.check_finished.connect(self.update_last_check_time)
             self.update_checker.start()
 
-        self.manager_thread = threading.Thread(target=self.download_manager, daemon=True)
-        self.manager_thread.start()
-
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_ui)
         self.timer.start(500)
-
-        # Off-peak scheduler: poll on a slow timer; boundaries flip task status.
-        self.schedule = self.settings.get("schedule") or offpeak.default_schedule()
-        self.offpeak_controller = offpeak.OffPeakScheduler(self.schedule)
-        self.offpeak_session = None
-        self.offpeak_session_uids = None
-        self._offpeak_probing = False
-        self._offpeak_open_ready.connect(self._do_offpeak_open)
-        self.sched_timer = QTimer()
-        self.sched_timer.timeout.connect(self.scheduler_tick)
-        self.sched_timer.start(30_000)
-        # Kick a first poll shortly after launch so a wake-launched app (or one
-        # opened mid-window) starts downloading without waiting a full interval.
-        QTimer.singleShot(1500, self.scheduler_tick)
 
         self._refresh_schedule_indicator()
         self._refresh_wake_task()
@@ -1126,15 +903,19 @@ class MainWindow(QMainWindow):
         # Offer to finish installing an update that was deferred to "next open".
         QTimer.singleShot(1200, self._check_pending_update)
 
+        # Download manager and off-peak scheduler threads.
+        self.engine.start()
+
+    @property
+    def schedule(self):
+        return self.engine.schedule
+
     def closeEvent(self, event):
-        save_history(self.tasks)
         col_widths = {}
         for i in range(self.tree.columnCount()):
             col_widths[str(i)] = self.tree.columnWidth(i)
         self.settings["column_widths"] = col_widths
-        save_settings(self.settings)
-        offpeak.allow_sleep()
-        self.turnstile_solver.stop()
+        self.engine.stop()   # saves history and settings, stops the solver
         event.accept()
 
     def setup_ui(self):
@@ -1419,6 +1200,8 @@ class MainWindow(QMainWindow):
         
         self.extract_checkbox = QCheckBox("Auto-Extract")
         self.extract_checkbox.setChecked(self.settings.get("extract_after_download", False))
+        # Flips auto-extract for this session; the saved default changes in Settings.
+        self.extract_checkbox.toggled.connect(lambda on: setattr(self.engine, "auto_extract", on))
         action_layout.addWidget(self.extract_checkbox)
         
         clear_btn = QPushButton("Clear Done")
@@ -1539,11 +1322,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Could not open folder:\n{e}")
 
     def trigger_history_save(self):
-        if not hasattr(self, '_history_save_timer'):
-            self._history_save_timer = QTimer()
-            self._history_save_timer.setSingleShot(True)
-            self._history_save_timer.timeout.connect(lambda: save_history(self.tasks))
-        QMetaObject.invokeMethod(self._history_save_timer, "start", Qt.ConnectionType.QueuedConnection, Q_ARG(int, 500))
+        self.engine.trigger_history_save()
 
     def add_task_to_ui(self, task):
         batch_item = self.get_or_create_batch_item(task.folder_name)
@@ -1613,13 +1392,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Could not read log file: {e}")
 
     def load_tasks_from_history(self):
-        loaded_tasks = load_history()
-        for task in loaded_tasks:
+        # The engine already loaded the history; this only builds the rows.
+        for task in list(self.tasks):
             self.add_task_to_ui(task)
-            if task.status == "Extracted":
-                self.extracted_folders.add(task.folder_name)
-            elif task.status == "Extracting...":
-                task.status = "Completed"
 
         # Collapse batches that are already completed on app startup
         for i in range(self.tree.topLevelItemCount()):
@@ -1842,7 +1617,7 @@ class MainWindow(QMainWindow):
                         
                     return
                 
-                save_history(self.tasks)
+                self.engine.save_now()
                 save_settings(self.settings)
 
                 bat_path = os.path.join(tempfile.gettempdir(), f"silverspoon_update_{int(time.time())}.bat")
@@ -1924,7 +1699,7 @@ class MainWindow(QMainWindow):
                     and os.path.exists(t.filepath)):
                 t.install_handled = True
                 # Save now, not debounced: "Install now" quits the app.
-                save_history(self.tasks)
+                self.engine.save_now()
                 self._prompt_install(t)
 
     def install_selected_update(self):
@@ -1984,13 +1759,8 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             # Merge (not replace) so keys the dialog doesn't manage — e.g. the
             # off-peak "schedule" — are preserved.
-            self.settings.update(dialog.get_updated_settings())
-            save_settings(self.settings)
+            self.engine.update_settings(dialog.get_updated_settings())
             self.switch_theme(self.settings.get("theme", "Dark"))
-            self.max_workers = self.settings.get("max_workers", 3)
-            new_timeout = self.settings.get("captcha_timeout", 10)
-            self.turnstile_solver.TOKEN_TIMEOUT = new_timeout
-            self.turnstile_solver.show_window = self.settings.get("show_solver_browser", False)
             default_dir = self.settings.get("default_save_dir", os.path.join(os.path.expanduser("~"), "Downloads"))
             self.dir_input.setText(default_dir)
             self.extract_checkbox.setChecked(self.settings.get("extract_after_download", False))
@@ -2018,12 +1788,8 @@ class MainWindow(QMainWindow):
         dialog = DownloadSchedulerDialog(self.schedule, scope_label, self)
         if not dialog.exec():
             return
-        self.schedule = dialog.get_schedule()
         # None => whole queue; a list of task uids => only those downloads.
-        self.schedule["targets"] = targets
-        self.settings["schedule"] = self.schedule
-        save_settings(self.settings)
-        self.offpeak_controller.update(self.schedule)
+        self.engine.set_schedule(dialog.get_schedule(), targets)
 
         # (Un)register the Windows wake timer to match the saved settings.
         if self.schedule.get("enabled") and self.schedule.get("wake_timer"):
@@ -2059,19 +1825,11 @@ class MainWindow(QMainWindow):
         """Alt C: compact dot. Hidden when disabled; hover shows the full text."""
         text = offpeak.describe_schedule(self.schedule)
         try:
-            window_active = bool(self.offpeak_controller._active)
+            window_active = bool(self.engine.offpeak_controller._active)
         except Exception:
             window_active = False
         start = self.schedule.get("start", "") if isinstance(self.schedule, dict) else ""
         self.schedule_dot.set_state(text, window_active=window_active, start_hhmm=start)
-
-    def _scheduled_tasks(self):
-        """Tasks the active schedule targets: all, or only the chosen uids."""
-        targets = self.schedule.get("targets")
-        if not targets:
-            return list(self.tasks)
-        targets = set(targets)
-        return [t for t in self.tasks if t.uid in targets]
 
     def _launch_command(self):
         """Executable + argument string used by the wake task to relaunch the app."""
@@ -2079,101 +1837,15 @@ class MainWindow(QMainWindow):
             return sys.executable, "--background"
         return sys.executable, f'"{os.path.abspath(__file__)}" --background'
 
-    def _task_key(self, task):
-        # Stable uid, not link: two tasks can share a link (re-added/duplicate),
-        # which would collide in the session's byte/completion accounting.
-        return task.uid
-
-    def scheduler_tick(self):
-        now = _dt.datetime.now()
-        if self.offpeak_session is not None:
-            global_speed = sum(
-                t.speed for t in self.tasks if t.status == "Downloading")
-            self.offpeak_session.sample_speed(global_speed)
-        edge = self.offpeak_controller.poll(now)
-        if edge == "open":
-            self._offpeak_open(now)
-        elif edge == "close":
-            self._offpeak_close(now)
-        # Keep the dot's green/blue tint in sync with the controller's
-        # active edge without cluttering the header.
-        if edge is not None:
-            self._refresh_schedule_indicator()
-
-    def _offpeak_open(self, now):
-        # Probe connectivity off the GUI thread (~1.5s) so the poll timer never
-        # stalls the UI. On success the probe emits _offpeak_open_ready, whose
-        # GUI-thread slot (_do_offpeak_open) does the Qt/task work.
-        if self._offpeak_probing:
-            return
-        self._offpeak_probing = True
-
-        def probe():
-            try:
-                if offpeak.check_connection():
-                    self._offpeak_open_ready.emit(now)
-                else:
-                    # No connection yet: the next tick (still inside the window)
-                    # will re-fire "open" and retry.
-                    self.offpeak_controller.cancel_open()
-                    logging.warning("Off-peak: no internet connection at window open; will retry.")
-            finally:
-                self._offpeak_probing = False
-
-        threading.Thread(target=probe, daemon=True).start()
-
-    def _do_offpeak_open(self, now):
-        if self.schedule.get("keep_awake", True):
-            offpeak.prevent_sleep()
-
-        scheduled = self._scheduled_tasks()
-        session = offpeak.OffPeakSession(now)
-        for task in scheduled:
-            key = self._task_key(task)
-            session.snapshot[key] = task.downloaded_bytes
-            if task.status in ("Completed", "Extracted", "Extract Cancelled"):
-                session.completed_before.add(key)
-        self.offpeak_session = session
-        self.offpeak_session_uids = {t.uid for t in scheduled}
-
-        started = 0
-        for task in scheduled:
-            if task.status in ("Queued", "Paused", "Cancelled", "Error",
-                               "CAPTCHA Timeout"):
-                task.status = "Pending"
-                task.error_message = ""
-                task.cancel_flag = False
-                task.pause_flag = False
-                started += 1
-        logging.info("Download window opened; queued %d task(s).", started)
-
-    def _offpeak_close(self, now):
-        offpeak.allow_sleep()
-        # Pause only the tasks this window was responsible for.
-        uids = getattr(self, "offpeak_session_uids", None)
-        for task in self.tasks:
-            if uids is not None and task.uid not in uids:
-                continue
-            if task.status in ("Downloading", "Pending", "Starting..."):
-                task.pause_flag = True
-                task.status = "Pausing..." if task.status == "Downloading" else "Paused"
-
-        session = self.offpeak_session
-        self.offpeak_session = None
-        if session is None:
-            return
-
-        scheduled = [t for t in self.tasks if uids is None or t.uid in uids]
-        bytes_now = {self._task_key(t): t.downloaded_bytes for t in scheduled}
-        completed_now = {self._task_key(t) for t in scheduled
-                         if t.status in ("Completed", "Extracted", "Extract Cancelled")}
-        summary = offpeak.summarize(session, now, bytes_now, completed_now)
-        report_path = offpeak.get_report_path()
-        report_saved = offpeak.append_report(summary, report_path)
-        if not report_saved:
-            logging.warning("Failed to append off-peak report to %s", report_path)
-        logging.info("Scheduled download window closed; %s", summary)
-        self._show_offpeak_summary(summary, report_path if report_saved else None)
+    def _process_engine_events(self):
+        """Handle what the engine reported since the last tick (it runs the
+        scheduler itself, on its own thread)."""
+        for event in self.engine.events_since(self._last_event_id):
+            self._last_event_id = event["id"]
+            if event["type"] in ("schedule_edge", "schedule_changed"):
+                self._refresh_schedule_indicator()
+            elif event["type"] == "offpeak_summary":
+                self._show_offpeak_summary(event["summary"], event["report_path"])
 
     def _show_offpeak_summary(self, summary, report_path):
         gb = summary["bytes_downloaded"] / (1024 ** 3)
@@ -2223,43 +1895,24 @@ class MainWindow(QMainWindow):
                 self.text_links.setText(text)
 
     def add_links(self):
-        text = self.text_links.toPlainText().strip()
-        if not text:
-            return
-            
-        links = [line.strip().lstrip("- ") for line in text.split('\n') if line.strip() and line.lstrip("- ").startswith('http')]
+        links = parse_links(self.text_links.toPlainText())
         if not links:
             return
-            
+
         save_dir = os.path.abspath(self.dir_input.text())
-        
-        # Try to guess a folder name from the first link
-        suggested_folder = ""
-        first_link = links[0]
-        first_filename = filename_from_link(first_link)
-        match = re.search(r'(.*?)(\.part\d+\.rar|\.rar)$', first_filename, re.IGNORECASE)
-        if match:
-            suggested_folder = match.group(1).strip('._-')
-        else:
-            suggested_folder = first_filename.rsplit('.', 1)[0]
-            
-        suggested_folder = suggested_folder.replace('_--_fitgirl-repacks.site', '').replace('_--_', ' ').replace('_', ' ').strip()
 
         folder_name, ok = QInputDialog.getText(
             self, 
             "Batch Folder Name", 
             "Enter a folder name for these files:\n(This groups main game and optional files together)",
             QLineEdit.EchoMode.Normal,
-            suggested_folder
+            suggest_folder(links)
         )
         
         if not ok or not folder_name.strip():
             return
             
-        folder_name = folder_name.strip()
-        
-        for link in links:
-            task = DownloadTask(link, save_dir, folder_name)
+        for task in self.engine.add_links(links, save_dir, folder_name.strip()):
             self.add_task_to_ui(task)
             
         self.text_links.clear()
@@ -2350,39 +2003,32 @@ class MainWindow(QMainWindow):
                     selected_tasks.append(task)
         return selected_tasks
 
+    def _selected_uids(self):
+        return [t.uid for t in self.get_selected_tasks()]
+
     def start_downloads(self):
-        for task in self.get_selected_tasks():
-            if task.status in ("Queued", "Cancelled", "Error", "Paused", "Pausing...", "CAPTCHA Timeout", "Solving CAPTCHA...", "Waiting for you to solve CAPTCHA"):
-                task.status = "Pending"
-                task.error_message = ""
-                task.cancel_flag = False
-                task.pause_flag = False
+        self.engine.start_tasks(self._selected_uids())
 
     def pause_selected(self):
-        for task in self.get_selected_tasks():
-            if task.status in ("Downloading", "Pending", "Starting..."):
-                task.pause_flag = True
-                task.status = "Pausing..." if task.status == "Downloading" else "Paused"
+        self.engine.pause_tasks(self._selected_uids())
 
     def cancel_selected(self):
-        for task in self.get_selected_tasks():
-            if task.status == "Extracting...":
-                # extract_folder notices within ~0.2 s, kills the extractor
-                # and sets "Extract Cancelled" (the download itself is kept).
-                task.cancel_flag = True
-            elif task.status in ("Downloading", "Pending", "Paused", "Starting...", "Queued"):
-                task.cancel_flag = True
-                task.pause_flag = False
-                task.status = "Cancelled"
+        self.engine.cancel_tasks(self._selected_uids())
 
     def retry_selected(self):
-        for task in self.get_selected_tasks():
-            if "Error" in task.status or task.status == "CAPTCHA Timeout":
-                task.status = "Pending"
-                task.error_message = ""
-                task.cancel_flag = False
-                task.pause_flag = False
-                task.retry_count = 0
+        self.engine.retry_tasks(self._selected_uids())
+
+    def _remove_tree_item(self, task):
+        if not task.tree_item:
+            return
+        parent = task.tree_item.parent()
+        if parent:
+            parent.removeChild(task.tree_item)
+            # If the batch is now empty, remove it too.
+            if parent.childCount() == 0:
+                idx = self.tree.indexOfTopLevelItem(parent)
+                if idx >= 0:
+                    self.tree.takeTopLevelItem(idx)
 
     def force_redownload_selected(self):
         tasks_to_redownload = self.get_selected_tasks()
@@ -2390,13 +2036,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No Selection", "Select one or more tasks to force redownload.")
             return
 
-        active_statuses = {"Downloading", "Pending", "Starting...", "Pausing...", "Extracting..."}
-
-        files_with_progress = []
-        for task in tasks_to_redownload:
-            if task.status not in active_statuses and task.progress > 0 and task.status != "Error":
-                files_with_progress.append(task)
-                
+        uids = [t.uid for t in tasks_to_redownload]
+        files_with_progress = self.engine.redownload_with_progress(uids)
         if files_with_progress:
             reply = QMessageBox.warning(
                 self, 'Confirm Force Redownload',
@@ -2408,72 +2049,40 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
-        redownloaded = 0
-        skipped = 0
-        failed = 0
-
-        for task in tasks_to_redownload:
-            if task.status in active_statuses:
-                skipped += 1
-                continue
-
-            try:
-                if os.path.exists(task.filepath):
-                    os.remove(task.filepath)
-                if os.path.exists(segment_state_path(task.filepath)):
-                    os.remove(segment_state_path(task.filepath))
-            except Exception as e:
-                failed += 1
-                task.status = "Error"
-                task.error_message = f"Could not delete existing file before redownload. {format_error_message(e)}"
-                continue
-
-            task.cancel_flag = False
-            task.pause_flag = False
-            task.progress = 0.0
-            task.speed = 0.0
-            task.downloaded_bytes = 0
-            task.total_bytes = 0
-            task.error_message = ""
-            task.status = "Pending"
-            # A fresh download of an update asks again when it completes.
-            task.install_handled = False
-            self.extracted_folders.discard(task.folder_name)
-            redownloaded += 1
-
-        if skipped or failed or redownloaded == 0:
+        result = self.engine.force_redownload(uids)
+        if result["skipped"] or result["failed"] or result["queued"] == 0:
             QMessageBox.information(
                 self,
                 "Force Redownload",
-                f"Queued: {redownloaded}\nSkipped active tasks: {skipped}\nFailed: {failed}"
+                f"Queued: {result['queued']}\nSkipped active tasks: {result['skipped']}\nFailed: {result['failed']}"
             )
 
     def delete_selected(self):
         tasks_to_delete = self.get_selected_tasks()
         if not tasks_to_delete:
             return
-            
+
         delete_files = False
-        
+
         if not self.settings.get("skip_delete_confirmation", False):
             dialog = QDialog(self)
             dialog.setWindowTitle("Confirm Delete")
             layout = QVBoxLayout(dialog)
-            
+
             label = QLabel(f"Are you sure you want to delete {len(tasks_to_delete)} selected task(s)?")
             layout.addWidget(label)
-            
+
             file_checkbox = QCheckBox("Also delete downloaded files from disk")
             layout.addWidget(file_checkbox)
-            
+
             dont_ask_checkbox = QCheckBox("Don't ask again")
             layout.addWidget(dont_ask_checkbox)
-            
+
             button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Yes | QDialogButtonBox.StandardButton.No)
             button_box.accepted.connect(dialog.accept)
             button_box.rejected.connect(dialog.reject)
             layout.addWidget(button_box)
-            
+
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 delete_files = file_checkbox.isChecked()
                 if dont_ask_checkbox.isChecked():
@@ -2482,57 +2091,15 @@ class MainWindow(QMainWindow):
                     save_settings(self.settings)
             else:
                 return # Cancelled
-                
-        # Proceed with deletion
+
         for task in tasks_to_delete:
-            # 1. Cancel the task if it's active
-            task.cancel_flag = True
-            task.status = "Cancelled"
+            self._remove_tree_item(task)
+        self.engine.delete_tasks([t.uid for t in tasks_to_delete], delete_files)
 
-            # 2. Delete the physical file if requested
-            if delete_files and os.path.exists(task.filepath):
-                try:
-                    os.remove(task.filepath)
-                    if os.path.exists(segment_state_path(task.filepath)):
-                        os.remove(segment_state_path(task.filepath))
-                except Exception as e:
-                    logging.error("Failed to delete %s: %s", task.filepath, e)
-
-            # 3. Remove from UI tree
-            if task.tree_item:
-                parent = task.tree_item.parent()
-                if parent:
-                    parent.removeChild(task.tree_item)
-                    if parent.childCount() == 0:
-                        idx = self.tree.indexOfTopLevelItem(parent)
-                        if idx >= 0:
-                            self.tree.takeTopLevelItem(idx)
-                            
-            # 4. Remove from tasks list
-            if task in self.tasks:
-                self.tasks.remove(task)
-                
-        self.trigger_history_save()
-                
     def clear_finished(self):
-        to_remove = [t for t in self.tasks if t.status in ("Completed", "Extracted", "Cancelled", "Extract Cancelled")]
-        
-        if not to_remove:
-            return
-            
-        for t in to_remove:
-            if t.tree_item:
-                parent = t.tree_item.parent()
-                if parent:
-                    parent.removeChild(t.tree_item)
-                    # If parent batch is now empty, remove it too
-                    if parent.childCount() == 0:
-                        idx = self.tree.indexOfTopLevelItem(parent)
-                        if idx >= 0:
-                            self.tree.takeTopLevelItem(idx)
-            self.tasks.remove(t)
-            
-        self.trigger_history_save()
+        for task in self.engine.clear_finished():
+            self._remove_tree_item(task)
+
 
     def format_eta(self, seconds):
         if seconds <= 0 or seconds == float('inf'):
@@ -2715,51 +2282,16 @@ class MainWindow(QMainWindow):
 
         self._check_update_task_done()
 
-    def download_manager(self):
-        while True:
-            # CAPTCHA resolution belongs to the same worker slot as the actual
-            # transfer. Otherwise each resolving task stops counting as active
-            # and the manager can exceed the configured concurrency limit.
-            active = sum(
-                1 for t in self.tasks
-                if t.status in ("Downloading", "Starting...", "Solving CAPTCHA...", "Waiting for you to solve CAPTCHA")
-            )
-            if active < self.max_workers:
-                for task in self.tasks:
-                    if task.status == "Pending":
-                        task.status = "Starting..."
-                        threading.Thread(target=self.download_worker, args=(task,), daemon=True).start()
-                        active += 1
-                        if active >= self.max_workers:
-                            break
-            
-            # Check for extraction
-            if self.extract_checkbox.isChecked():
-                self.check_extraction()
-                
-            time.sleep(1)
-            
     def manual_extract_selected(self):
         selected_tasks = self.get_selected_tasks()
         if not selected_tasks:
             QMessageBox.information(self, "No Selection", "Select one or more tasks to extract.")
             return
-            
-        # Group tasks by folder name to extract batch-by-batch
-        folders = {}
-        for task in selected_tasks:
-            if task.folder_name not in folders:
-                folders[task.folder_name] = []
-            folders[task.folder_name].append(task)
-            
-        to_extract = {}
-        for folder_name, tasks_in_folder in folders.items():
-            if any(t.status == "Extracting..." for t in tasks_in_folder):
-                continue
-            to_extract[folder_name] = [t for t in self.tasks if t.folder_name == folder_name]
 
+        uids = [t.uid for t in selected_tasks]
         # Re-extracting overwrites what's on disk, so confirm it first.
-        already = [name for name, folder_tasks in to_extract.items() if self._already_extracted(folder_tasks)]
+        already = self.engine.extract_preview(uids)
+        skip = ()
         if already:
             shown = "\n".join(f"  • {name}" for name in already[:10])
             if len(already) > 10:
@@ -2771,704 +2303,10 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
             if reply != QMessageBox.StandardButton.Yes:
-                for name in already:
-                    to_extract.pop(name)
+                skip = already
 
-        for folder_name, all_folder_tasks in to_extract.items():
-            # Remove from extracted set so it can be extracted again if needed
-            self.extracted_folders.discard(folder_name)
-            self.extracted_folders.add(folder_name)
-
-            # An explicit "Extract Now" always extracts, even over existing files.
-            threading.Thread(target=self.extract_folder, args=(all_folder_tasks, True), daemon=True).start()
-
-    def check_extraction(self):
-        # Group tasks by folder
-        folders = {}
-        for task in self.tasks:
-            if task.folder_name not in folders:
-                folders[task.folder_name] = []
-            folders[task.folder_name].append(task)
-            
-        for folder_name, tasks_in_folder in folders.items():
-            if folder_name in self.extracted_folders:
-                continue
-
-            # Never auto-extract an app-update download.
-            if any(getattr(t, "is_update", False) for t in tasks_in_folder):
-                continue
-
-            valid_extraction_statuses = {"Completed", "Extracted", "Extracting..."}
-            if tasks_in_folder and all(t.status in valid_extraction_statuses for t in tasks_in_folder):
-                if all(t.status == "Extracted" for t in tasks_in_folder):
-                    self.extracted_folders.add(folder_name)
-                    continue
-                    
-                # If ANY task in this folder is currently Extracting..., don't spawn another thread
-                if any(t.status == "Extracting..." for t in tasks_in_folder):
-                    continue
-                    
-                self.extracted_folders.add(folder_name)
-                threading.Thread(target=self.extract_folder, args=(tasks_in_folder,), daemon=True).start()
-
-    @staticmethod
-    def _archive_volumes(save_dir):
-        """First volume of each archive in save_dir, i.e. what the extractor is given."""
-        files = sorted(os.listdir(save_dir))
-        vols = []
-        for f in files:
-            # 1. Main multipart start (.part01.rar, .part1.rar)
-            if re.search(r'\.part0*1\.rar$', f, re.IGNORECASE):
-                vols.append(os.path.join(save_dir, f))
-            # 2. Sequential start (.001)
-            elif re.search(r'\.001$', f):
-                vols.append(os.path.join(save_dir, f))
-            # 3. Standalone .rar or .zip (not part of a sequence)
-            elif f.lower().endswith(('.rar', '.zip')) and not re.search(r'\.part\d+\.rar$', f, re.IGNORECASE):
-                vols.append(os.path.join(save_dir, f))
-        if not vols and files:
-            # Fallback to just the first file alphabetically
-            vols.append(os.path.join(save_dir, files[0]))
-        return vols
-
-    @staticmethod
-    def _find_extractor():
-        """(extractor_type, command, seven_zip) for this platform; extractor_type
-        is None if nothing is installed. seven_zip reads archive listings, also
-        when WinRAR does the extracting, and is None if no 7-Zip is available."""
-        extractor_type = None
-        base_cmd = None
-        bundled_7z = None
-        if sys.platform == 'win32':
-            # Windows: prefer installed 7-Zip > WinRAR > bundled 7z.exe
-            if hasattr(sys, '_MEIPASS'):
-                bundled_7z = os.path.join(sys._MEIPASS, '7z.exe')
-            else:
-                bundled_7z = os.path.join(os.path.dirname(os.path.abspath(__file__)), '7z.exe')
-            installed_7z = r"C:\Program Files\7-Zip\7z.exe"
-            installed_winrar = r"C:\Program Files\WinRAR\WinRAR.exe"
-            if os.path.exists(installed_7z):
-                extractor_type = '7z'
-                base_cmd = installed_7z
-            elif os.path.exists(installed_winrar):
-                extractor_type = 'winrar'
-                base_cmd = installed_winrar
-            elif os.path.exists(bundled_7z):
-                extractor_type = '7z'
-                base_cmd = bundled_7z
-        else:
-            # 7z (p7zip, or Ubuntu's 7zip package); Debian 12's 7zip only has 7zz.
-            seven_zip_cmd = next((n for n in ('7z', '7zz', '7za') if shutil.which(n)), None)
-            if seven_zip_cmd:
-                extractor_type = '7z'
-                base_cmd = seven_zip_cmd
-            elif shutil.which('unrar'):
-                extractor_type = 'unrar'
-                base_cmd = 'unrar'
-
-        if extractor_type == '7z':
-            seven_zip = base_cmd
-        elif bundled_7z and os.path.exists(bundled_7z):
-            seven_zip = bundled_7z
-        else:
-            seven_zip = next((shutil.which(n) for n in ('7z', '7zz', '7za') if shutil.which(n)), None)
-        return extractor_type, base_cmd, seven_zip
-
-    def _already_extracted(self, tasks_in_folder):
-        """True if the folder is marked Extracted, or every file in its
-        archives is already on disk with the right size."""
-        if all(t.status == "Extracted" for t in tasks_in_folder):
-            return True
-        save_dir = tasks_in_folder[0].save_dir
-        try:
-            vols = self._archive_volumes(save_dir)
-        except OSError:
-            return False
-        seven_zip = self._find_extractor()[2]
-        if not vols or not seven_zip:
-            return False
-        for vol in vols:
-            entries = list_archive(seven_zip, vol)
-            if not (entries and is_extracted(entries, save_dir)):
-                return False
-        return True
-
-    def extract_folder(self, tasks_in_folder, force=False):
-        save_dir = tasks_in_folder[0].save_dir
-        folder_name = tasks_in_folder[0].folder_name
-
-        for t in tasks_in_folder:
-            t.status = "Extracting..."
-            t.extract_progress = None
-            t.cancel_flag = False
-
-        # Cancel (or Delete) on any task of the folder stops its extraction.
-        def should_stop():
-            return any(t.cancel_flag for t in tasks_in_folder)
-
-        try:
-            vols_to_extract = self._archive_volumes(save_dir)
-            if not vols_to_extract:
-                for t in tasks_in_folder:
-                    t.status = "Extract Error (No File)"
-                    t.error_message = f"No archive file was found in {save_dir}."
-                if folder_name in self.extracted_folders:
-                    self.extracted_folders.remove(folder_name)
-                return
-
-            extractor_type, base_cmd, seven_zip = self._find_extractor()
-            if not extractor_type:
-                for t in tasks_in_folder:
-                    t.status = "Extract Error (No extractor found)"
-                    t.error_message = "No supported extractor was found. Install 7-Zip or WinRAR, then retry extraction."
-                if folder_name in self.extracted_folders:
-                    self.extracted_folders.remove(folder_name)
-                return
-
-            listings = [list_archive(seven_zip, vol) if seven_zip else None for vol in vols_to_extract]
-
-            # Auto-extract skips archives whose files are already all on disk
-            # with matching sizes (e.g. extracted earlier, outside the app or
-            # before the history was reset).
-            if not force and all(entries and is_extracted(entries, save_dir) for entries in listings):
-                for t in tasks_in_folder:
-                    t.status = "Extracted"
-                    t.error_message = ""
-                    t.extract_progress = None
-                self.trigger_history_save()
-                return
-
-            # Weight each archive by its unpacked size so the bar moves evenly
-            # across a folder with several archives.
-            weights = [sum(size for _, size in entries) if entries else 0 for entries in listings]
-            if not all(weights):
-                weights = [1] * len(vols_to_extract)
-            total_weight = sum(weights)
-            done_weight = 0
-
-            # Extract each base volume found
-            for vol, weight in zip(vols_to_extract, weights):
-                if should_stop():
-                    raise ExtractionCancelled()
-                if extractor_type == '7z':
-                    cmd = [base_cmd, 'x', vol, f'-o{save_dir}', '-y', '-bsp1', '-bso0']
-                elif extractor_type == 'winrar':
-                    cmd = [base_cmd, 'x', '-y', vol, f'{save_dir}\\']
-                elif extractor_type == 'unrar':
-                    cmd = [base_cmd, 'x', vol, f'{save_dir}/', '-y']
-
-                def report(percent, base=done_weight, weight=weight):
-                    value = (base + weight * percent / 100) / total_weight * 100
-                    for t in tasks_in_folder:
-                        t.extract_progress = value
-
-                returncode, output = run_with_progress(cmd, report, should_stop)
-                if returncode != 0:
-                    raise subprocess.CalledProcessError(returncode, cmd, output=output)
-                done_weight += weight
-
-            for t in tasks_in_folder:
-                t.status = "Extracted"
-                t.error_message = ""
-                t.extract_progress = None
-            self.trigger_history_save()
-
-        except ExtractionCancelled:
-            # Partly extracted files stay on disk; "Extract Now" redoes it. The
-            # folder stays in extracted_folders and the status isn't one
-            # check_extraction picks up, so auto-extract won't restart it.
-            for t in tasks_in_folder:
-                if t.status == "Extracting...":  # a deleted task is already "Cancelled"
-                    t.status = "Extract Cancelled"
-                t.extract_progress = None
-                t.cancel_flag = False
-            self.trigger_history_save()
-        except subprocess.CalledProcessError as e:
-            logging.error(f"Extraction error (subprocess): {e}\n{(e.output or '')[-500:]}", exc_info=True)
-            for t in tasks_in_folder:
-                t.status = "Extract Error (Corrupt?)"
-                t.error_message = f"Extractor failed with exit code {e.returncode}. The archive may be corrupt, incomplete, or password-protected."
-            if folder_name in self.extracted_folders:
-                self.extracted_folders.remove(folder_name)
-            self.trigger_history_save()
-        except Exception as e:
-            logging.error(f"Extraction error: {e}", exc_info=True)
-            for t in tasks_in_folder:
-                t.status = f"Extract Error"
-                t.error_message = f"Extraction failed: {format_error_message(e)}"
-            if folder_name in self.extracted_folders:
-                self.extracted_folders.remove(folder_name)
-            self.trigger_history_save()
-
-    def get_direct_link(self, task):
-        try:
-            task.status = "Solving CAPTCHA..."
-
-            def notify(waiting):
-                # The solver shows its window when a check needs a human click.
-                task.status = "Waiting for you to solve CAPTCHA" if waiting else "Solving CAPTCHA..."
-
-            result = self.turnstile_solver.get_direct_link(task.link, notify=notify)
-            direct_link = result.get("direct_url")
-            if direct_link:
-                # Stash cookies/UA on the task for the download transport
-                task._dl_cookies = result.get("cookies", {})
-                task._dl_user_agent = result.get("user_agent", "")
-                return direct_link
-            task.status = "CAPTCHA Timeout"
-            task.error_message = "The file host did not return a direct download link. The link may be expired or unavailable."
-        except Exception as e:
-            logging.error(f"Error getting direct link for {task.link}: {e}", exc_info=True)
-            if "after " in str(e) and " seconds" in str(e):
-                task.status = "CAPTCHA Timeout"
-            else:
-                task.status = "Error"
-            task.error_message = f"Could not get the direct download link. {format_error_message(e)}"
-            return None
-        if not task.error_message:
-            task.status = "Error"
-            task.error_message = "Could not get the direct download link. The link may be expired or blocked."
-        return None
-
-    def _download_direct_file(self, task, url=None):
-        """Download a plain, direct URL via urllib (stdlib), with resume,
-        pause/cancel and progress. Used for app updates, form hosts (url is
-        then the resolved link) and any non-resolver host. Kept off the shared
-        curl_cffi session, which hangs (curl 28) for a manager-spawned worker
-        that skips the get_direct_link/nodriver path."""
-        try:
-            os.makedirs(task.save_dir, exist_ok=True)
-        except Exception as e:
-            task.status = "Error"
-            task.error_message = (
-                f"Failed to create download folder '{task.save_dir}'. "
-                f"{format_error_message(e)}")
-            self.trigger_history_save()
-            return
-
-        url = url or task.link
-        headers = {"User-Agent": f"SilverSpoon/{CURRENT_VERSION}"}
-        self._adopt_server_filename(task, url, headers)
-        if self._download_segmented(task, url, headers):
-            return
-
-        initial_size = os.path.getsize(task.filepath) if os.path.exists(task.filepath) else 0
-        req = urllib.request.Request(url, headers=headers)
-        if initial_size > 0:
-            req.add_header("Range", f"bytes={initial_size}-")
-
-        task.status = "Downloading"
-        task.error_message = ""
-        try:
-            with contextlib.closing(urllib.request.urlopen(req, timeout=30)) as r:
-                status = getattr(r, "status", 200) or 200
-                content_range = r.headers.get("Content-Range")
-                content_length = r.headers.get("Content-Length")
-                if status == 206 and content_range:
-                    m = re.search(r'/([0-9]+)$', content_range)
-                    task.total_bytes = int(m.group(1)) if m else 0
-                    mode = "ab"
-                else:
-                    # Server ignored Range (or none asked) -> full body, restart.
-                    task.total_bytes = int(content_length) if content_length else 0
-                    initial_size = 0
-                    mode = "wb"
-                task.downloaded_bytes = initial_size
-
-                now = time.time()
-                samples = deque([(now, task.downloaded_bytes)])
-                with open(task.filepath, mode) as f:
-                    while True:
-                        if task.pause_flag:
-                            task.status = "Paused"; task.speed = 0; return
-                        if task.cancel_flag:
-                            task.status = "Cancelled"; task.speed = 0; return
-                        chunk = r.read(65536)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        task.downloaded_bytes += len(chunk)
-                        now = time.time()
-                        samples.append((now, task.downloaded_bytes))
-                        while len(samples) > 1 and now - samples[0][0] > 3:
-                            samples.popleft()
-                        w0t, w0b = samples[0]
-                        dur = now - w0t
-                        if dur > 0:
-                            task.speed = ((task.downloaded_bytes - w0b) / dur) / (1024 * 1024)
-                        if task.total_bytes > 0:
-                            task.progress = (task.downloaded_bytes / task.total_bytes) * 100
-
-            task.progress = 100
-            task.speed = 0
-            task.status = "Completed"
-            task.error_message = ""
-            self.trigger_history_save()
-        except urllib.error.HTTPError as he:
-            if he.code == 416 and initial_size > 0:
-                # Range not satisfiable -> the file is already fully downloaded.
-                task.total_bytes = initial_size
-                task.downloaded_bytes = initial_size
-                task.progress = 100
-                task.speed = 0
-                task.status = "Completed"
-                task.error_message = ""
-                self.trigger_history_save()
-                return
-            self._update_download_failed(task, he)
-        except Exception as e:
-            self._update_download_failed(task, e)
-
-    def _adopt_server_filename(self, task, url, headers):
-        """Links like bzzhr.to/<id> carry no file name, so the task would be
-        named after the id with no extension. Before anything is written, take
-        the name the server sends (Content-Disposition) instead."""
-        if os.path.splitext(task.filename)[1] or os.path.exists(task.filepath) \
-                or os.path.exists(segment_state_path(task.filepath)):
-            return
-        try:
-            req = urllib.request.Request(url, headers={**headers, "Range": "bytes=0-0"})
-            with contextlib.closing(urllib.request.urlopen(req, timeout=30)) as r:
-                name = filename_from_content_disposition(r.headers.get("Content-Disposition"))
-        except Exception as e:
-            logging.warning("Could not read the server file name for %s: %s", task.link, e)
-            return
-        if name and name != task.filename:
-            task.filename = name
-            task.filepath = os.path.normpath(os.path.join(task.save_dir, name))
-            self.trigger_history_save()
-
-    def _download_segmented(self, task, url, headers):
-        """Download over several connections when the server supports ranges.
-        Returns True when it handled the task (finished, paused, cancelled or
-        failed) and False to fall back to the single-connection path."""
-        connections = max(1, int(self.settings.get("max_connections", 4)))
-        state = segment_state_path(task.filepath)
-        resuming = os.path.exists(state)
-        if connections <= 1 and not resuming:
-            return False
-        try:
-            total, ranges = probe_ranges(url, headers)
-        except Exception as e:
-            if not resuming:
-                return False  # let the single-connection path report it
-            self._update_download_failed(task, e)
-            return True
-        if not ranges or total <= 0:
-            if resuming:
-                # A half-done segmented file can't be continued without ranges;
-                # its size isn't the downloaded byte count, so start over.
-                for p in (state, task.filepath):
-                    if os.path.exists(p):
-                        os.remove(p)
-            return False
-        if total < 2 * MIN_SEGMENT and not resuming:
-            return False  # too small to be worth splitting
-
-        task.status = "Downloading"
-        task.error_message = ""
-        task.total_bytes = total
-        samples = deque()
-
-        def on_progress(done):
-            now = time.time()
-            task.downloaded_bytes = done
-            task.progress = done / total * 100
-            samples.append((now, done))
-            while len(samples) > 1 and now - samples[0][0] > 3:
-                samples.popleft()
-            dur = now - samples[0][0]
-            if dur > 0:
-                task.speed = ((done - samples[0][1]) / dur) / (1024 * 1024)
-
-        # Same per-download share of the global limit as the curl transport.
-        limit_mb_s = self.settings.get("bandwidth_limit", 0)
-        max_workers = self.settings.get("max_workers", 3)
-        bytes_per_second = (limit_mb_s * 1024 * 1024) / max_workers if limit_mb_s > 0 and max_workers > 0 else 0
-
-        try:
-            finished = SegmentedDownload(
-                url, task.filepath, total, connections=connections, headers=headers,
-                should_stop=lambda: task.pause_flag or task.cancel_flag,
-                on_progress=on_progress, bytes_per_second=bytes_per_second,
-            ).run()
-        except Exception as e:
-            task.speed = 0
-            self._update_download_failed(task, e)
-            return True
-        task.speed = 0
-        if not finished:
-            # Progress is saved beside the file; Start/Resume continues it.
-            task.status = "Cancelled" if task.cancel_flag else "Paused"
-            return True
-        task.downloaded_bytes = total
-        task.progress = 100
-        task.status = "Completed"
-        task.error_message = ""
-        self.trigger_history_save()
-        return True
-
-    def _update_download_failed(self, task, exc):
-        logging.error("Direct download error for %s: %s", task.link, exc, exc_info=True)
-        if task.cancel_flag or task.pause_flag:
-            return
-        if self.settings.get("auto_retry_errors", False) and task.retry_count < 3:
-            task.retry_count += 1
-            task.status = "Pending"
-            task.error_message = ""
-        else:
-            task.status = "Error"
-            what = "Update download" if getattr(task, "is_update", False) else "Download"
-            task.error_message = f"{what} failed. {format_error_message(exc)}"
-        self.trigger_history_save()
-
-    def _resolve_form_link(self, task):
-        """Direct URL for a form host (FileKeeper) link, or None if it failed
-        or the task was paused/cancelled during the countdown. Resolved afresh
-        on every start/resume, so an expired signed link never sticks."""
-        def wait(seconds):
-            end = time.time() + seconds
-            while time.time() < end and not (task.cancel_flag or task.pause_flag):
-                time.sleep(0.25)
-
-        try:
-            url = resolve_form_link(task.link, sleep=wait)
-        except Exception as e:
-            logging.error("Form host resolution error for %s: %s", task.link, e, exc_info=True)
-            if task.cancel_flag or task.pause_flag:
-                return None
-            if self.settings.get("auto_retry_errors", False) and task.retry_count < 3:
-                task.retry_count += 1
-                task.status = "Pending"
-                task.error_message = ""
-            else:
-                task.status = "Error"
-                detail = str(e) if isinstance(e, ResolveError) else format_error_message(e)
-                task.error_message = f"Could not get the direct download link. {detail}"
-            self.trigger_history_save()
-            return None
-        if task.cancel_flag or task.pause_flag:
-            return None  # cancel_selected/pause_selected already set the status
-        return url
-
-    def download_worker(self, task):
-        # App updates and any non-resolver (general direct) URL download straight
-        # over HTTP via urllib; form hosts (FileKeeper) first trade the page for
-        # a direct link over plain HTTP. Only FuckingFast/DataNodes-style links
-        # go through the Turnstile/CAPTCHA solver + curl transport.
-        if getattr(task, "is_update", False) or not needs_resolution(task.link):
-            url = None
-            if not getattr(task, "is_update", False) and needs_form_resolution(task.link):
-                url = self._resolve_form_link(task)
-                if not url:
-                    return
-            self._download_direct_file(task, url)
-            return
-
-        dl_url = self.get_direct_link(task)
-        if not dl_url:
-            if not task.cancel_flag and not task.pause_flag:
-                # Don't auto-retry a CAPTCHA timeout: re-solving immediately just
-                # respawns the browser and rarely succeeds.
-                if (self.settings.get("auto_retry_errors", False)
-                        and task.retry_count < 3
-                        and task.status != "CAPTCHA Timeout"):
-                    task.retry_count += 1
-                    task.status = "Pending"
-                    task.error_message = ""
-                    logging.info(f"Auto-retrying {task.filename} (attempt {task.retry_count}/3) after missing direct link")
-                else:
-                    if task.status != "CAPTCHA Timeout":
-                        task.status = "Error"
-                    if not task.error_message:
-                        task.error_message = "Could not get the direct download link."
-            return
-            
-        if task.cancel_flag:
-            task.status = "Cancelled"
-            return
-            
-        if task.pause_flag:
-            task.status = "Paused"
-            return
-
-        if download_resolved_directly(task.link):
-            # bzzhr.to: the resolved link needs no browser cookies, so use the
-            # direct downloader (resume, multiple connections, server file name).
-            self._download_direct_file(task, dl_url)
-            return
-
-        task.status = "Downloading"
-        task.error_message = ""
-        
-        try:
-            if not os.path.exists(task.save_dir):
-                try:
-                    os.makedirs(task.save_dir, exist_ok=True)
-                except Exception as e:
-                    if self.settings.get("auto_retry_errors", False) and task.retry_count < 3:
-                        task.retry_count += 1
-                        task.status = "Pending"
-                        task.error_message = ""
-                        logging.info(f"Auto-retrying {task.filename} (attempt {task.retry_count}/3) after directory error")
-                    else:
-                        task.status = "Error"
-                        task.error_message = f"Failed to create save directory '{task.save_dir}'. {format_error_message(e)}"
-                    self.trigger_history_save()
-                    return
-                
-            initial_size = 0
-            if os.path.exists(task.filepath):
-                initial_size = os.path.getsize(task.filepath)
-                
-            headers = {}
-            if getattr(task, '_dl_user_agent', None):
-                headers['User-Agent'] = task._dl_user_agent
-                
-            head_req = self.dl_session.head(dl_url, cookies=getattr(task, '_dl_cookies', {}), headers=headers, allow_redirects=True)
-            # Some hosts reject HEAD while accepting the actual ranged GET. Only
-            # trust Content-Length when the HEAD request itself succeeded.
-            total_size = 0
-            if 200 <= head_req.status_code < 300:
-                try:
-                    total_size = int(head_req.headers.get('content-length', 0))
-                except (TypeError, ValueError):
-                    total_size = 0
-            task.total_bytes = total_size
-            
-            if initial_size > 0 and initial_size == total_size:
-                task.downloaded_bytes = total_size
-                task.progress = 100
-                task.status = "Completed"
-                task.error_message = ""
-                return
-                
-            resume_header = headers.copy()
-            mode = 'wb'
-            if initial_size > 0:
-                resume_header['Range'] = f'bytes={initial_size}-'
-                mode = 'ab'
-                
-            with contextlib.closing(self.dl_session.get(dl_url, stream=True, headers=resume_header, cookies=getattr(task, '_dl_cookies', {}))) as r:
-                if r.status_code == 416 and initial_size > 0:
-                    content_range = r.headers.get('content-range', '')
-                    match = re.search(r'/([0-9]+)$', content_range)
-                    if match and initial_size == int(match.group(1)):
-                        task.total_bytes = initial_size
-                        task.downloaded_bytes = initial_size
-                        task.progress = 100
-                        task.speed = 0
-                        task.status = "Completed"
-                        task.error_message = ""
-                        self.trigger_history_save()
-                        return
-                if r.status_code not in (200, 206):
-                    if r.status_code in (403, 503):
-                        preview = r.text[:500] if hasattr(r, 'text') else "No text body"
-                        logging.error(f"Download 403/503 for {dl_url}. Body preview: {preview}")
-                    
-                    if self.settings.get("auto_retry_errors", False) and task.retry_count < 3:
-                        task.retry_count += 1
-                        task.status = "Pending"
-                        task.error_message = ""
-                        logging.info(f"Auto-retrying {task.filename} (attempt {task.retry_count}/3) after HTTP {r.status_code}")
-                    else:
-                        task.status = "Error"
-                        task.error_message = f"Download request failed. Server returned HTTP {r.status_code}."
-                    return
-                    
-                if r.status_code == 200 and initial_size > 0:
-                    # server ignores range header, restart from beginning
-                    mode = 'wb'
-                    initial_size = 0
-                    
-                task.downloaded_bytes = initial_size
-                if total_size == 0:
-                    content_range = r.headers.get('content-range', '')
-                    match = re.search(r'/([0-9]+)$', content_range)
-                    if match:
-                        task.total_bytes = int(match.group(1))
-                    else:
-                        try:
-                            task.total_bytes = int(r.headers.get('content-length', 0)) + initial_size
-                        except (TypeError, ValueError):
-                            task.total_bytes = 0
-                    
-                start_time = time.time()
-                last_time = start_time
-                bytes_since_last = 0
-                # Keep a short history instead of reporting only the latest
-                # half-second burst of socket data.
-                speed_samples = deque([(start_time, task.downloaded_bytes)])
-                
-                with open(task.filepath, mode) as f:
-                    limit_mb_s = self.settings.get("bandwidth_limit", 0)
-                    max_workers = self.settings.get("max_workers", 3)
-                    
-                    limit_bytes_s = 0
-                    if limit_mb_s > 0 and max_workers > 0:
-                        limit_bytes_s = (limit_mb_s * 1024 * 1024) / max_workers
-                    
-                    for chunk in r.iter_content(chunk_size=8192*8):
-                        if task.pause_flag:
-                            task.status = "Paused"
-                            task.speed = 0
-                            return
-                        if task.cancel_flag:
-                            task.status = "Cancelled"
-                            task.speed = 0
-                            return
-                            
-                        if chunk:
-                            f.write(chunk)
-                            size = len(chunk)
-                            task.downloaded_bytes += size
-                            bytes_since_last += size
-                            
-                            now = time.time()
-                            
-                            # Simple Token Bucket / Sleep for Bandwidth Limiting
-                            if limit_bytes_s > 0:
-                                expected_time = bytes_since_last / limit_bytes_s
-                                actual_time = now - last_time
-                                if expected_time > actual_time:
-                                    time.sleep(expected_time - actual_time)
-                                    now = time.time()
-                            
-                            speed_samples.append((now, task.downloaded_bytes))
-                            while len(speed_samples) > 1 and now - speed_samples[0][0] > 3:
-                                speed_samples.popleft()
-                            window_start, window_bytes = speed_samples[0]
-                            window_duration = now - window_start
-                            if window_duration > 0:
-                                task.speed = (
-                                    (task.downloaded_bytes - window_bytes) / window_duration
-                                ) / (1024 * 1024)
-                            if task.total_bytes > 0:
-                                task.progress = (task.downloaded_bytes / task.total_bytes) * 100
-
-                            if now - last_time > 0.5:
-                                last_time = now
-                                bytes_since_last = 0
-                
-                task.progress = 100
-                task.speed = 0
-                task.status = "Completed"
-                task.error_message = ""
-                self.trigger_history_save()
-                
-        except Exception as e:
-            logging.error(f"Download worker error for task {task.link}: {e}", exc_info=True)
-            if not task.cancel_flag and not task.pause_flag:
-                if self.settings.get("auto_retry_errors", False) and task.retry_count < 3:
-                    task.retry_count += 1
-                    task.status = "Pending"
-                    task.error_message = ""
-                    logging.info(f"Auto-retrying {task.filename} (attempt {task.retry_count}/3)")
-                else:
-                    task.status = "Error"
-                    task.error_message = f"Download failed. {format_error_message(e)}"
-                self.trigger_history_save()
+        # An explicit "Extract Now" always extracts, even over existing files.
+        self.engine.extract(uids, skip)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

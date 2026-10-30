@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SilverSpoon</title>
+<link rel="icon" href="logo.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><img src="logo.png" alt=""><span>SilverSpoon</span><small id="version"></small></div>
+  <div class="stats">
+    <div class="stat"><b id="stat-active">0</b><span>Active</span></div>
+    <div class="stat"><b id="stat-queued">0</b><span>Queued</span></div>
+    <div class="stat"><b id="stat-done">0</b><span>Done</span></div>
+    <div class="stat speed"><b id="stat-speed">0.00 MB/s</b><canvas id="graph" width="160" height="36"></canvas></div>
+  </div>
+  <div class="top-actions">
+    <button id="schedule-dot" class="dot hidden" title=""></button>
+    <button id="btn-scheduler">Scheduler</button>
+    <button id="btn-settings">Settings</button>
+    <button id="btn-theme" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<div id="captcha-banner" class="banner hidden">
+  <span>A Cloudflare check needs you: complete <b>“Verify you are human”</b> in the solver browser.</span>
+  <button id="btn-solve" class="primary">Solve now</button>
+</div>
+
+<main>
+  <section class="card add">
+    <textarea id="links" placeholder="Paste download links here, one per line…" rows="4"></textarea>
+    <div class="row">
+      <button id="btn-paste">Paste</button>
+      <button id="btn-import">Import .txt</button>
+      <input type="file" id="file-import" accept=".txt,text/plain" class="hidden">
+      <label class="grow">Save to <input id="save-dir" type="text"></label>
+      <label class="check"><input id="auto-extract" type="checkbox"> Auto-Extract</label>
+      <button id="btn-add" class="primary">Add to Queue</button>
+    </div>
+  </section>
+
+  <section class="toolbar">
+    <button id="btn-select-all">Select All</button>
+    <button data-action="start" class="primary">Start / Resume</button>
+    <button data-action="pause">Pause</button>
+    <button data-action="cancel">Cancel</button>
+    <button data-action="retry">Retry</button>
+    <button data-action="extract">Extract Now</button>
+    <button data-action="delete" class="danger">Delete</button>
+    <span class="spacer"></span>
+    <button id="btn-clear">Clear Finished</button>
+  </section>
+
+  <section class="card table-wrap">
+    <table id="queue">
+      <thead><tr>
+        <th class="c-check"></th><th>Name</th><th class="c-status">Status</th>
+        <th class="c-prog">Progress</th><th class="c-num">Speed</th><th class="c-num">ETA</th><th class="c-size">Size</th>
+      </tr></thead>
+      <tbody id="queue-body"></tbody>
+    </table>
+    <div id="empty" class="empty">The queue is empty. Paste some links above to get started.</div>
+  </section>
+</main>
+
+<div id="ctx" class="ctx hidden"></div>
+<div id="toast" class="toast hidden"></div>
+
+<!-- Dialogs -->
+<dialog id="dlg-folder">
+  <form method="dialog">
+    <h3>Batch Folder Name</h3>
+    <p>This groups main game and optional files together.</p>
+    <input id="folder-name" type="text" autocomplete="off">
+    <menu><button value="cancel">Cancel</button><button value="ok" class="primary" id="folder-ok">Add</button></menu>
+  </form>
+</dialog>
+
+<dialog id="dlg-confirm">
+  <form method="dialog">
+    <h3 id="confirm-title"></h3>
+    <div id="confirm-body"></div>
+    <label class="check hidden" id="confirm-files-row"><input type="checkbox" id="confirm-files"> Also delete downloaded files from disk</label>
+    <label class="check hidden" id="confirm-dontask-row"><input type="checkbox" id="confirm-dontask"> Don't ask again</label>
+    <menu><button value="no">No</button><button value="yes" class="primary" id="confirm-yes">Yes</button></menu>
+  </form>
+</dialog>
+
+<dialog id="dlg-settings">
+  <form method="dialog" id="form-settings">
+    <h3>Settings</h3>
+    <div class="form">
+      <label>Application theme <select name="theme"><option>Dark</option><option>Light</option></select></label>
+      <label>Default save directory <input name="default_save_dir" type="text"></label>
+      <label>Max concurrent downloads <input name="max_workers" type="number" min="1" max="10"></label>
+      <label>Connections per download <input name="max_connections" type="number" min="1" max="16"></label>
+      <label>Global bandwidth limit (MB/s, 0 = unlimited) <input name="bandwidth_limit" type="number" min="0" max="1000"></label>
+      <label>CAPTCHA solve timeout (seconds) <input name="captcha_timeout" type="number" min="5" max="120"></label>
+      <label class="check"><input name="show_solver_browser" type="checkbox"> Keep the CAPTCHA browser visible in the solver view</label>
+      <label class="check"><input name="extract_after_download" type="checkbox"> Extract after download</label>
+      <label class="check"><input name="auto_retry_errors" type="checkbox"> Automatically retry failed downloads (up to 3 times)</label>
+      <label class="check"><input name="skip_delete_confirmation" type="checkbox"> Skip delete confirmation</label>
+    </div>
+    <p class="err" id="settings-err"></p>
+    <menu><button value="cancel">Cancel</button><button value="save" class="primary" id="settings-save">Save</button></menu>
+  </form>
+</dialog>
+
+<dialog id="dlg-schedule">
+  <form method="dialog" id="form-schedule">
+    <h3>Download Scheduler</h3>
+    <p>Scheduling: <b id="sched-scope">entire queue</b></p>
+    <div class="form">
+      <div class="inline">Start <select id="s-start-h"></select>:<select id="s-start-m"></select><select id="s-start-ap"><option>AM</option><option>PM</option></select></div>
+      <div class="inline">End <select id="s-end-h"></select>:<select id="s-end-m"></select><select id="s-end-ap"><option>AM</option><option>PM</option></select></div>
+      <small>End before start = window crosses midnight.</small>
+      <label class="check"><input type="radio" name="recurrence" value="weekly"> Repeat weekly on:</label>
+      <div class="inline days" id="s-days"></div>
+      <label class="check"><input type="radio" name="recurrence" value="once"> Run once on: <input type="date" id="s-date"></label>
+      <label class="check"><input type="checkbox" id="s-keep-awake"> Keep the host awake while the window is open</label>
+    </div>
+    <p class="err" id="sched-err"></p>
+    <menu>
+      <button value="cancel">Cancel</button>
+      <button value="remove" class="danger" id="sched-remove">Remove Schedule</button>
+      <button value="add" class="primary" id="sched-add">Add Schedule</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="dlg-solver" class="wide">
+  <form method="dialog"><h3>Solve the CAPTCHA</h3>
+    <p>Click inside the browser view to complete the check. It closes by itself once the task moves on.</p>
+    <iframe id="solver-frame" title="Solver browser"></iframe>
+    <menu><button value="close">Close</button></menu>
+  </form>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>

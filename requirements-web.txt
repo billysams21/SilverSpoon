@@ -1,0 +1,7 @@
+# Web/Docker edition: the engine plus the FastAPI server (no PyQt6).
+curl_cffi>=0.7,<1.0
+# pre-1.0, minor bumps can break the CAPTCHA solver
+nodriver>=0.50,<0.51
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx>=0.27
